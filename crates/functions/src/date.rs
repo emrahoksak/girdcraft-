@@ -263,8 +263,16 @@ fn days(a: &[Arg], c: &mut dyn Ctx) -> R<Value> {
     num_val((day_arg(a, 0, sys)? - day_arg(a, 1, sys)?) as f64)
 }
 
+/// Excel's last day of February. In the 1900 date system February 1900 carries the fictitious
+/// 29th (serial 60), so the 28th is not a month end and the 29th is (#4012).
 fn last_of_feb(d: &DateTime) -> bool {
-    d.month == 2 && d.day == days_in_month(d.year, 2)
+    if d.month != 2 {
+        return false;
+    }
+    if d.year == 1900 {
+        return d.day == 29;
+    }
+    d.day == days_in_month(d.year, 2)
 }
 
 fn days360(a: &[Arg], c: &mut dyn Ctx) -> R<Value> {
@@ -496,7 +504,16 @@ fn yearfrac(a: &[Arg], c: &mut dyn Ctx) -> R<Value> {
     let sys = c.date_system();
     let s = day_arg(a, 0, sys)?;
     let e = day_arg(a, 1, sys)?;
-    let basis = if has(a, 2) { to_int(num(a, 2)?)? } else { 0 };
+    let basis = if has(a, 2) {
+        let raw = num(a, 2)?;
+        // Excel rejects any negative basis before truncation: -0.9 would truncate to 0 and slip through.
+        if raw < 0.0 {
+            return Err(CellError::Num);
+        }
+        to_int(raw)?
+    } else {
+        0
+    };
     num_val(yearfrac_core(sys, s, e, basis)?)
 }
 
@@ -788,6 +805,17 @@ mod tests {
         close(ev("DAYS360", vec![n(d(2011.0, 1.0, 1.0)), n(d(2011.0, 1.0, 31.0))]), 30.0);
     }
 
+    /// Excel's 1900 calendar has 29 February 1900 (serial 60), so in the US method the 28th is not
+    /// a month end and the 29th is. The European method is unaffected (#4012).
+    #[test]
+    fn days360_across_the_fictitious_1900_02_29() {
+        close(ev("DAYS360", vec![n(59.0), n(61.0)]), 3.0);
+        close(ev("DAYS360", vec![n(60.0), n(61.0)]), 1.0);
+        close(ev("DAYS360", vec![n(59.0), n(61.0), b(true)]), 3.0);
+        close(ev("DAYS360", vec![n(60.0), n(61.0), b(true)]), 2.0);
+        close(ev("DAYS360", vec![n(61.0), n(62.0)]), 1.0);
+    }
+
     #[test]
     fn working_days() {
         let s = d(2012.0, 10.0, 1.0);
@@ -848,6 +876,19 @@ mod tests {
         close(ev("YEARFRAC", vec![n(d(2021.0, 1.0, 30.0)), n(d(2021.0, 3.0, 31.0)), n(0.0)]), 1.0 / 6.0);
         close(ev("YEARFRAC", vec![n(d(2020.0, 2.0, 29.0)), n(d(2021.0, 2.0, 28.0)), n(0.0)]), 1.0);
         close(ev("YEARFRAC", vec![n(d(2021.0, 2.0, 28.0)), n(d(2021.0, 2.0, 28.0)), n(0.0)]), 0.0);
+    }
+
+    #[test]
+    fn yearfrac_rejects_negative_fractional_basis() {
+        // Excel rejects any negative basis: -0.9 must not truncate to 0.
+        let (s, e) = (n(d(2024.0, 1.0, 15.0)), n(d(2025.0, 6.0, 30.0)));
+        is_err(ev("YEARFRAC", vec![s.clone(), e.clone(), n(-0.9)]), CellError::Num);
+        // A positive fraction still truncates to basis 0.
+        let whole = match ev("YEARFRAC", vec![s.clone(), e.clone(), n(0.0)]) {
+            Value::Number(x) => x,
+            v => panic!("YEARFRAC basis 0 gave {v:?}"),
+        };
+        close_tol(ev("YEARFRAC", vec![s, e, n(0.9)]), whole, 1e-12);
     }
 
     #[test]

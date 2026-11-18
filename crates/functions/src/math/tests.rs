@@ -9,6 +9,29 @@ fn ev2(name: &str, x: f64, y: f64) -> Value {
     ev(name, vec![n(x), n(y)])
 }
 
+// #4291: INT drops binary noise below Excel's 15 digits before rounding down, as FLOOR.MATH does,
+// and keeps a difference those digits show.
+#[test]
+fn int_rounds_down_the_15_digit_value() {
+    let int = |x: f64| ev1("INT", x);
+    let eps = 2f64.powi(-51);
+    assert_eq!(int(3.0 - eps), Value::Number(3.0));
+    assert_eq!(int(-3.0 - eps), Value::Number(-3.0));
+    assert_eq!(int(3.0 - 2f64.powi(-39)), Value::Number(2.0));
+    assert_eq!(int(-3.0 - 2f64.powi(-39)), Value::Number(-4.0));
+    assert_eq!(int(0.1 + 0.2 + 0.7 - 1e-16), Value::Number(1.0));
+    assert_eq!(int(2.999_999_999_999_9), Value::Number(2.0));
+    assert_eq!(int(-0.5), Value::Number(-1.0));
+    assert_eq!(int(1e300), Value::Number(1e300));
+    // 15 digits of ±f64::MAX round past it; INT keeps the number, as before.
+    assert!(!clean(f64::MAX).is_finite());
+    assert_eq!(int(f64::MAX), Value::Number(f64::MAX));
+    assert_eq!(int(-f64::MAX), Value::Number(-f64::MAX));
+    for x in [3.0 - eps, -3.0 - eps, 3.0 - 2f64.powi(-39), -2.5] {
+        assert_eq!(int(x), ev1("FLOOR.MATH", x), "INT and FLOOR.MATH agree at {x}");
+    }
+}
+
 #[test]
 fn percentof() {
     // SUM(subset) / SUM(all): text, booleans and blanks inside ranges are skipped like SUM.
@@ -137,6 +160,26 @@ fn rounding() {
     close(ev1("ODD", -1.0), -1.0);
     close(ev1("ODD", -2.0), -3.0);
     close(ev1("ODD", 0.0), 1.0);
+}
+
+#[test]
+fn even_and_odd_round_the_stored_value_without_cleanup() {
+    // Native Excel (#4290): a value one or two ulps above an integer is above it.
+    close(ev1("EVEN", 4.0 + 2f64.powi(-50)), 6.0);
+    close(ev1("ODD", 3.0 + 2f64.powi(-51)), 5.0);
+    close(ev1("ODD", -3.0 - 2f64.powi(-51)), -5.0);
+    close(ev1("EVEN", -4.0 - 2f64.powi(-50)), -6.0);
+    // The integer itself, and the value just below it, are unchanged.
+    close(ev1("EVEN", 4.0), 4.0);
+    close(ev1("EVEN", 4.0 - 2f64.powi(-51)), 4.0);
+    close(ev1("ODD", 3.0), 3.0);
+    close(ev1("ODD", 3.0 - 2f64.powi(-51)), 3.0);
+    // From 2^53, where ODD has no exact answer, the results are as before.
+    // (exact comparisons: `close` would accept any of these neighbours)
+    assert_eq!(ev1("ODD", 2f64.powi(53)), Value::Number(9_007_199_254_740_991.0));
+    assert_eq!(ev1("EVEN", 2f64.powi(53)), Value::Number(9_007_199_254_740_990.0));
+    assert_eq!(ev1("ODD", 2f64.powi(53) - 1.0), Value::Number(9_007_199_254_740_991.0));
+    assert_eq!(ev1("EVEN", 2f64.powi(53) - 2.0), Value::Number(9_007_199_254_740_990.0));
 }
 
 #[test]

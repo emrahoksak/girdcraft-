@@ -78,6 +78,30 @@ fn seek_unit() {
 }
 
 #[test]
+fn scenario_show_preserves_captured_formula_and_boolean_like_text() {
+    let mut s = s();
+    s.execute("cell.set", json!({"cell": "A1", "input": "'=1+1"})).unwrap();
+    s.execute("cell.set", json!({"cell": "B1", "input": "=ISFORMULA(A1)"})).unwrap();
+    s.execute("cell.set", json!({"cell": "C1", "input": "'TRUE"})).unwrap();
+    s.execute("cell.set", json!({"cell": "D1", "input": "'FALSE"})).unwrap();
+    s.execute("cell.set", json!({"cell": "E1", "input": "'0012"})).unwrap();
+    s.execute("data.scenarioAdd", json!({"name": "Captured", "changing": "A1,C1:E1"})).unwrap();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["Before"]]})).unwrap();
+
+    s.execute("data.scenarioShow", json!({"name": "Captured"})).unwrap();
+
+    assert_eq!(v(&s, "A1"), Value::from("=1+1"));
+    assert_eq!(v(&s, "B1"), Value::Bool(false), "A1 must remain text to its dependent formula");
+    assert_eq!(v(&s, "C1"), Value::from("TRUE"));
+    assert_eq!(v(&s, "D1"), Value::from("FALSE"));
+    assert_eq!(n(&s, "E1"), 12.0);
+    let sh = s.doc().unwrap().wb.active().unwrap().clone();
+    for address in ["A1", "C1", "D1"] {
+        assert!(sh.cell(CellRef::parse(address).unwrap()).is_some_and(|cell| cell.formula.is_none()), "{address} must remain text");
+    }
+}
+
+#[test]
 fn scenario_show_restores_a_percentage_cells_stored_number() {
     let mut s = s();
     s.execute("home.numberFormat", json!({"range": "B2", "format": "Percentage"})).unwrap();
@@ -299,6 +323,39 @@ fn consolidate_by_position_and_label() {
 }
 
 #[test]
+fn consolidate_rejects_non_string_sources_without_changing_the_document() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [[2, 3]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "D1", "input": "99"})).unwrap();
+    // Keep both undo and redo populated so a refused request must preserve them.
+    s.execute("cell.set", json!({"cell": "C1", "input": "redo marker"})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    let (before, revision, undo, redo) = {
+        let doc = s.doc().unwrap();
+        assert!(!doc.undo.is_empty() && !doc.redo.is_empty());
+        (doc.wb.clone(), doc.revision, doc.undo.len(), doc.redo.len())
+    };
+    for bad in [json!(null), json!(false), json!(7), json!({"range": "B1"}), json!(["B1"])] {
+        // All-invalid arrays already fail; valid neighbors expose silent omission.
+        let params = json!({"sources": ["A1", bad, "B1"], "destination": "D1"});
+        let error = s.execute("data.consolidate", params.clone()).unwrap_err().to_string();
+        assert!(error.contains("sources must contain only range strings"), "{params}: {error}");
+        let doc = s.doc().unwrap();
+        assert_eq!(*doc.wb, *before, "{params}");
+        assert_eq!((doc.revision, doc.undo.len(), doc.redo.len()), (revision, undo, redo), "{params}");
+        assert_eq!(n(&s, "D1"), 99.0, "{params}");
+    }
+    s.execute("edit.redo", json!({})).unwrap();
+    assert_eq!(v(&s, "C1"), Value::from("redo marker"));
+    for sources in [json!(["A1", "B1"]), json!("A1;B1")] {
+        // Either accepted form must replace the sentinel with the complete result.
+        s.execute("cell.set", json!({"cell": "D1", "input": "99"})).unwrap();
+        s.execute("data.consolidate", json!({"sources": sources, "destination": "D1"})).unwrap();
+        assert_eq!(n(&s, "D1"), 5.0);
+    }
+}
+
+#[test]
 fn advanced_filter_refuses_a_list_times_criteria_product_over_the_work_limit() {
     let mut s = s();
     s.execute("range.setValues", json!({"range": "A1", "values": [["Name"], ["A"]]})).unwrap();
@@ -340,4 +397,31 @@ fn scenario_summary_counts_result_rows_in_its_cell_limit() {
     }
     let err = s.execute("data.scenarioSummary", json!({"resultCells": "C1:C255"})).unwrap_err().to_string();
     assert!(err.contains("too many cells"), "{err}");
+}
+
+#[test]
+fn advanced_filter_computed_criteria_on_separate_sheet_matches_excel() {
+    let mut s = s();
+    s.execute("sheet.rename", json!({"name": "Input Data"})).unwrap();
+    s.execute("home.insertSheet", json!({"name": "Rules"})).unwrap();
+    s.execute("range.setValues", json!({"sheet": "Input Data", "range": "A1", "values": [["ID", "Score"], [101, 10], [102, 30], [103, 20]]}))
+        .unwrap();
+    s.execute("range.setValues", json!({"sheet": "Rules", "range": "B2", "values": [[100], [0], [100]]})).unwrap();
+    s.execute("cell.set", json!({"sheet": "Rules", "cell": "D1", "input": "Probe"})).unwrap();
+    s.execute("sheet.activate", json!({"sheet": "Input Data"})).unwrap();
+
+    for (formula, expected) in [
+        ("=B2>24", vec![102.0]),
+        ("=$B2>24", vec![102.0]),
+        ("='Input Data'!B2>24", vec![102.0]),
+        ("=B$2>24", vec![101.0, 102.0, 103.0]),
+        ("=Rules!B2>24", vec![101.0, 102.0, 103.0]),
+    ] {
+        s.execute("cell.set", json!({"sheet": "Rules", "cell": "D2", "input": formula})).unwrap();
+        let r =
+            s.execute("data.advancedFilter", json!({"range": "'Input Data'!A1:B4", "criteria": "Rules!D1:D2", "copyTo": "'Input Data'!F1"})).unwrap();
+        assert_eq!(r["matched"], expected.len(), "formula {formula}");
+        let got: Vec<f64> = (0..expected.len()).map(|i| n(&s, &format!("'Input Data'!F{}", i + 2))).collect();
+        assert_eq!(got, expected, "formula {formula}");
+    }
 }

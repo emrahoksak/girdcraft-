@@ -16,11 +16,15 @@ pub(super) fn remove_duplicates(s: &mut Session, p: &Json) -> Result<Json> {
     // columns compared a million blank rows and reported them as removed duplicates).
     let r = sh.used_range().and_then(|u| r.intersection(&u)).unwrap_or(RangeRef::cell(r.start));
     let header = bool_param(p, "header").unwrap_or_else(|| guess_header(&d.wb, sh, r));
-    let cols: Vec<u32> = p
-        .get("columns")
-        .and_then(Json::as_array)
-        .map(|a| a.iter().filter_map(|c| col_param(Some(c), r.start.col)).collect())
-        .unwrap_or_else(|| (r.start.col..=r.end.col).collect());
+    let cols: Vec<u32> = match p.get("columns").and_then(Json::as_array) {
+        Some(columns) => columns
+            .iter()
+            .map(|c| {
+                col_param(Some(c), r.start.col).ok_or_else(|| bad("data.removeDuplicates", "`columns` must name at least one column of the range"))
+            })
+            .collect::<Result<_>>()?,
+        None => (r.start.col..=r.end.col).collect(),
+    };
     // With no column to compare, every row key is empty: the first row would survive and every
     // other row would be deleted as a duplicate. A column outside the range compares data the
     // user didn't select. Excel refuses both.
@@ -74,8 +78,21 @@ pub(super) fn remove_duplicates(s: &mut Session, p: &Json) -> Result<Json> {
                     .filter_map(move |col| sh.hyperlinks.get(&CellRef::new(*row, col)).map(|h| (CellRef::new(start + i as u32, col), h.clone())))
             })
             .collect();
+        // A kept row moves up to `start + i`; its formulas' relative references move with it, as
+        // in Sort and in Excel, so `=B4*2` moved to row 3 reads `=B3*2` (#3734).
+        let moved = |row: u32, to: u32, c: u32| {
+            let mut cell = sh.cell(CellRef::new(row, c)).cloned()?;
+            if to != row
+                && let Some(f) = cell.formula.as_deref()
+                && let Some(e) = f.expr()
+            {
+                let shifted = gridcraft_model::Formula::from_expr(gridcraft_formula::adjust::shift_relative(e, i64::from(to) - i64::from(row), 0));
+                cell.formula = Some(std::sync::Arc::new(gridcraft_model::Formula { array: f.array, dynamic: f.dynamic, ..shifted }));
+            }
+            Some(cell)
+        };
         let rows: Vec<Vec<Option<Cell>>> =
-            keep.iter().map(|row| (r.start.col..=r.end.col).map(|c| sh.cell(CellRef::new(*row, c)).cloned()).collect()).collect();
+            keep.iter().enumerate().map(|(i, row)| (r.start.col..=r.end.col).map(|c| moved(*row, start + i as u32, c)).collect()).collect();
         let shm = cx.sheet_mut(sheet)?;
         for row in start..=r.end.row {
             for c in r.start.col..=r.end.col {

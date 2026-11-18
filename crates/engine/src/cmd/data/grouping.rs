@@ -6,10 +6,12 @@ use super::{
 // ---------------------------------------------------------------- outline
 
 fn outline_lines(s: &Session, p: &Json) -> Result<(bool, u32, u32)> {
-    if let Some(r) = str_param(p, "rows").and_then(parse_lines) {
+    if let Some(text) = str_param(p, "rows") {
+        let r = parse_lines(text).ok_or_else(|| bad("rows", format!("not a range: {text}")))?;
         return Ok((true, r.start.row, r.end.row));
     }
-    if let Some(r) = str_param(p, "cols").and_then(parse_lines) {
+    if let Some(text) = str_param(p, "cols") {
+        let r = parse_lines(text).ok_or_else(|| bad("cols", format!("not a range: {text}")))?;
         return Ok((false, r.start.col, r.end.col));
     }
     let r = s.doc()?.selection.current();
@@ -223,7 +225,8 @@ pub(super) fn subtotal(s: &mut Session, p: &Json) -> Result<Json> {
         "max" => 4,
         "min" => 5,
         "product" => 6,
-        _ => 9,
+        "sum" => 9,
+        other => return Err(bad("data.subtotal", format!("unknown `function`: {other}"))),
     };
     let cols: Vec<u32> = p
         .get("columns")
@@ -279,8 +282,11 @@ pub(super) fn subtotal(s: &mut Session, p: &Json) -> Result<Json> {
     let lbl = CellRef::new(last, group_col).a1();
     s.execute("home.insertRows", json!({"sheet": sheet, "rows": format!("{}:{}", last + 1, last + 1)}))?;
     s.execute("cell.set", json!({"sheet": sheet, "cell": lbl, "input": format!("Grand {label}")}))?;
+    // The grand total's range ends at the last group's last data row, above that group's total,
+    // as Excel writes it: a value typed over that total doesn't reach the grand total, as a value
+    // typed over any other group's total doesn't either (SUBTOTAL skips only nested SUBTOTALs).
     for c in &cols {
-        let range = RangeRef::new(CellRef::new(first, *c), CellRef::new(last - 1, *c)).a1();
+        let range = RangeRef::new(CellRef::new(first, *c), CellRef::new(last - 2, *c)).a1();
         s.execute("cell.set", json!({"sheet": sheet, "cell": CellRef::new(last, *c).a1(), "input": format!("=SUBTOTAL({code},{range})")}))?;
     }
     // One outer group over every data and subtotal row, summarised by the grand total, as in

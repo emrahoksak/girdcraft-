@@ -202,8 +202,14 @@ fn rounddown(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
 fn trunc(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
     num_val(round_dir(num(a, 0)?, digits_arg(a, 1)?, false))
 }
+/// INT rounds down what Excel keeps of the number, its 15 significant digits, as FLOOR.MATH does:
+/// `3-2^-51` is 3, not 2, and `-3-2^-51` is -3 (#4291). Near ±`f64::MAX` those digits round past
+/// the largest double, so the number is used as it is: it is a whole number already.
 fn int_fn(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
-    unary(a, |x| Ok(x.floor()))
+    unary(a, |x| {
+        let c = clean(x);
+        Ok(if c.is_finite() { c } else { x }.floor())
+    })
 }
 
 fn mround(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
@@ -289,8 +295,12 @@ fn floor_precise(a: &[Arg], _c: &mut dyn Ctx) -> R<Value> {
 
 fn even_odd(x: f64, odd: bool) -> f64 {
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let ax = clean(x.abs());
-    let mut v = ax.ceil();
+    // No 15-digit cleanup first: Excel rounds the stored value, so 4 + 2^-50 is above 4 and EVEN
+    // gives 6 (#4290). From 2^53 every double is an even integer and the next odd one can't be
+    // stored, so that range keeps the earlier 15-digit handling, which still gives ODD an odd
+    // result at 2^53.
+    let ax = x.abs();
+    let mut v = if ax >= 9_007_199_254_740_992.0 { clean(ax) } else { ax }.ceil();
     if odd {
         if v % 2.0 == 0.0 {
             v += 1.0;

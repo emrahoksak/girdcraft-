@@ -31,6 +31,26 @@ fn median_finite_midpoint_does_not_overflow() {
 }
 
 #[test]
+fn subtotal_counts_pass_over_or_count_errors() {
+    // Native Excel (#4271): SUBTOTAL/AGGREGATE 2 (COUNT) passes over an error in the cells and
+    // 3 (COUNTA) counts it, as COUNT and COUNTA do; the other functions still return it.
+    for e in [CellError::NA, CellError::Div0] {
+        let cells = [nv(10.0), Value::Error(e)];
+        for (count, counta) in [(2, 3), (102, 103)] {
+            close(aggregate_values(count, &cells), 1.0);
+            close(aggregate_values(counta, &cells), 2.0);
+        }
+        for code in [1, 4, 5, 9, 12, 109] {
+            is_err(aggregate_values(code, &cells), e);
+        }
+        is_err(aggregate_values_k(14, &cells, &nv(1.0)), e);
+    }
+    let mixed = [nv(1.0), tv("x"), Value::Empty, Value::Error(CellError::Value), Value::Bool(true)];
+    close(aggregate_values(2, &mixed), 1.0);
+    close(aggregate_values(3, &mixed), 4.0);
+}
+
+#[test]
 fn median_midpoint_keeps_small_values_and_argument_semantics() {
     // Halving each operand unconditionally can lose the smallest numbers. Use exact
     // equality here: the usual aggregate-test tolerance would accept zero.
@@ -176,6 +196,25 @@ fn spread() {
     is_err(ev("KURT", vec![c(&[1.0, 2.0, 3.0])]), CellError::Div0);
     close_tol(ev("STANDARDIZE", vec![n(42.0), n(40.0), n(1.5)]), 1.333333333, 1e-9);
     is_err(ev("STANDARDIZE", vec![n(42.0), n(40.0), n(0.0)]), CellError::Num);
+}
+
+#[test]
+fn quartile_inc_refuses_negative_fractions() {
+    // Native Excel (#4279): a quart just below zero is #NUM!, in QUARTILE, QUARTILE.INC and
+    // AGGREGATE 17; zero and small positive quarts are quartile 0.
+    let d = || c(&[10.0, 20.0, 30.0, 40.0]);
+    let vals = [nv(10.0), nv(20.0), nv(30.0), nv(40.0)];
+    for q in [-0.9999, -0.1, -0.0001, -1.0] {
+        is_err(ev("QUARTILE.INC", vec![d(), n(q)]), CellError::Num);
+        is_err(ev("QUARTILE", vec![d(), n(q)]), CellError::Num);
+        is_err(aggregate_values_k(17, &vals, &nv(q)), CellError::Num);
+    }
+    for q in [0.0, 0.0001, 0.9999] {
+        close(ev("QUARTILE.INC", vec![d(), n(q)]), 10.0);
+        close(ev("QUARTILE", vec![d(), n(q)]), 10.0);
+        close(aggregate_values_k(17, &vals, &nv(q)), 10.0);
+    }
+    is_err(ev("QUARTILE.INC", vec![d(), n(5.0)]), CellError::Num);
 }
 
 #[test]
@@ -362,6 +401,21 @@ fn percentiles() {
     }
     close_tol(ev("PERCENTRANK.INC", vec![k.clone(), n(2.123_456_789), n(14.0)]), 0.187_242_798_166_66, 1e-15);
     close(ev("PERCENTRANK.EXC", vec![k, n(2.123_456_789), n(16.0)]), 0.265_432_098_625);
+}
+
+#[test]
+fn large_and_small_return_the_rank_error_before_a_data_error() {
+    // Native Excel (#4278): with an error in the data and another in the rank, LARGE and SMALL
+    // return the rank's error; with one error, that error.
+    let data = |e: CellError| rf(arr(vec![vec![nv(10.0), nv(20.0), Value::Error(e), nv(40.0)]]));
+    let rank = |e: CellError| rf(Value::Error(e));
+    for f in ["LARGE", "SMALL"] {
+        is_err(ev(f, vec![data(CellError::NA), rank(CellError::Div0)]), CellError::Div0);
+        is_err(ev(f, vec![data(CellError::Div0), rank(CellError::NA)]), CellError::NA);
+        is_err(ev(f, vec![data(CellError::NA), n(1.0)]), CellError::NA);
+        is_err(ev(f, vec![c(&[10.0, 20.0, 30.0, 40.0]), rank(CellError::Div0)]), CellError::Div0);
+    }
+    close(ev("LARGE", vec![c(&[10.0, 20.0, 30.0, 40.0]), n(1.0)]), 40.0);
 }
 
 #[test]
@@ -646,6 +700,22 @@ fn frequency_prob() {
     // Excel: any probability <= 0 is #NUM!, even when it sums to one and lies outside the limits.
     is_err(ev("PROB", vec![x.clone(), c(&[0.5, 0.0, 0.25, 0.25]), n(0.0), n(3.0)]), CellError::Num);
     is_err(ev("PROB", vec![x, c(&[0.5, 0.0, 0.25, 0.25]), n(2.0), n(3.0)]), CellError::Num);
+    // #4284: the weights total 1 to Excel's 15 digits. 1.00000001 and 0.99999999 are #NUM!, for
+    // the whole interval and for one outcome, as are 1.000001 and 0.9999999999999 (13 nines).
+    let x2 = c(&[1.0, 2.0]);
+    for w2 in [0.500_000_01, 0.499_999_99, 0.500_001, 0.499_999_999_999_9] {
+        is_err(ev("PROB", vec![x2.clone(), c(&[0.5, w2]), n(1.0), n(2.0)]), CellError::Num);
+        is_err(ev("PROB", vec![x2.clone(), c(&[0.5, w2]), n(1.0)]), CellError::Num);
+    }
+    assert_eq!(ev("PROB", vec![x2.clone(), c(&[0.5, 0.5]), n(1.0), n(2.0)]), nv(1.0));
+    assert_eq!(ev("PROB", vec![x2, c(&[0.5, 0.5]), n(1.0)]), nv(0.5));
+    // Binary noise in the total isn't a different total: ten weights of 0.1, and 0.7 + 0.2 + 0.1,
+    // sum to 0.9999999999999999.
+    let ten: Vec<f64> = (0..10).map(f64::from).collect();
+    assert_ne!([0.1; 10].iter().sum::<f64>(), 1.0);
+    close(ev("PROB", vec![c(&ten), c(&[0.1; 10]), n(0.0), n(9.0)]), 1.0);
+    assert_ne!([0.7, 0.2, 0.1].iter().sum::<f64>(), 1.0);
+    close(ev("PROB", vec![c(&[1.0, 2.0, 3.0]), c(&[0.7, 0.2, 0.1]), n(1.0)]), 0.7);
 }
 
 #[test]

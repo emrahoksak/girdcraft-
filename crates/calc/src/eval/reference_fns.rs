@@ -339,8 +339,11 @@ impl<'h> Evaluator<'h> {
             Err(e) => return err(e),
         };
         let (func, options, rest) = if name == "AGGREGATE" {
+            // Options are 0 to 7; Excel truncates a fraction inside that range (7.9 is 7) but
+            // answers #VALUE! for anything outside it, -0.5 included (#4270).
             let opt = match self.arg_num(args, 1, 0.0) {
-                Ok(n) => n.trunc() as u32,
+                Ok(n) if (0.0..8.0).contains(&n) => n.trunc() as u32,
+                Ok(_) => return err(CellError::Value),
                 Err(e) => return err(e),
             };
             (code, opt, &args[2..])
@@ -361,8 +364,20 @@ impl<'h> Evaluator<'h> {
         let mut values = Vec::new();
         let mut k = None;
         let refs = if name == "AGGREGATE" && func >= 14 { &rest[..1.min(rest.len())] } else { rest };
-        if name == "AGGREGATE" && func >= 14 {
-            k = rest.get(1).map(|e| self.value(e));
+        if name == "AGGREGATE"
+            && func >= 14
+            && let Some(e) = rest.get(1)
+        {
+            let ev = self.eval(e);
+            let from_ref = matches!(ev, Ev::R(_));
+            let v = self.deref(ev);
+            // An error k reached through a reference (a cell, a name, INDEX, INDIRECT) is
+            // #VALUE! in Excel, ahead of any error in the data; a computed error such as NA() or
+            // E1+0 stays itself (#4277).
+            if from_ref && v.is_error() {
+                return err(CellError::Value);
+            }
+            k = Some(v);
         }
         // Every cell visited (even one skipped as hidden, nested or an error) and every value
         // counts against one budget for the whole call. All arguments are evaluated (references

@@ -87,8 +87,7 @@ fn cash_flows() {
     let m = col(&[-120000.0, 39000.0, 30000.0, 21000.0, 37000.0, 46000.0]);
     close_tol(ev("MIRR", vec![rf(m), n(0.1), n(0.12)]), 0.1260943, 1e-6);
     close_tol(ev("MIRR", vec![rf(col(&[-120000.0, 39000.0, 30000.0, 21000.0])), n(0.1), n(0.12)]), -0.048044655, 1e-7);
-    is_err(ev("MIRR", vec![rf(col(&[1.0, 2.0])), n(0.1), n(0.1)]), CellError::Div0);
-    // Excel 365 gives -1 when every flow is negative: the positive flows are worth nothing.
+    is_err(ev("MIRR", vec![rf(col(&[1.0, 2.0])), n(0.1), n(0.1)]), CellError::Div0);    // Excel 365 gives -1 when every flow is negative: the positive flows are worth nothing.
     close_tol(ev("MIRR", vec![rf(col(&[-10000.0, -3400.0, -6500.0, -1000.0])), n(0.07), n(0.01)]), -1.0, 1e-12);
     close(ev("FVSCHEDULE", vec![n(1.0), av(row(&[0.09, 0.11, 0.1]))]), 1.33089);
     close(ev("EFFECT", vec![n(0.0525), n(4.0)]), 0.0535426673707584);
@@ -105,6 +104,19 @@ fn cash_flows() {
     close(ev("DOLLARFR", vec![n(1.125), n(32.0)]), 1.04);
     is_err(ev("DOLLARDE", vec![n(1.02), n(0.0)]), CellError::Div0);
     is_err(ev("DOLLARDE", vec![n(1.02), n(-1.0)]), CellError::Num);
+}
+
+/// Excel does not read a Boolean guess as 1/0: `XIRR(..., TRUE)` and `XIRR(..., FALSE)` are
+/// #VALUE!, from a literal and from a reference alike, while a numeric guess still solves (#4045).
+#[test]
+fn xirr_rejects_a_boolean_guess() {
+    let flows = || rf(col(&[-100.0, 110.0]));
+    let dates = || rf(col(&[1.0, 366.0]));
+    is_err(ev("XIRR", vec![flows(), dates(), b(true)]), CellError::Value);
+    is_err(ev("XIRR", vec![flows(), dates(), b(false)]), CellError::Value);
+    is_err(ev("XIRR", vec![flows(), dates(), Arg::reference(Value::Bool(true))]), CellError::Value);
+    is_err(ev("XIRR", vec![flows(), dates(), Arg::reference(Value::Bool(false))]), CellError::Value);
+    close_tol(ev("XIRR", vec![flows(), dates(), n(0.1)]), 0.0999999, 1e-6);
 }
 
 #[test]
@@ -170,6 +182,10 @@ fn securities() {
     close_tol(ev("TBILLYIELD", vec![d(2008, 3, 31), d(2008, 6, 1), n(98.45)]), 0.091417, 1e-6);
     close_tol(ev("TBILLEQ", vec![d(2008, 3, 31), d(2008, 6, 1), n(0.0914)]), 0.094151, 1e-6);
     is_err(ev("TBILLPRICE", vec![d(2008, 3, 31), d(2009, 6, 1), n(0.09)]), CellError::Num);
+    // #4080: a discount that drives the price to zero or below is rejected on the short branch too.
+    is_err(ev("TBILLEQ", vec![d(2023, 1, 1), d(2023, 7, 2), n(2.0)]), CellError::Num);
+    is_err(ev("TBILLEQ", vec![d(2023, 1, 1), d(2023, 7, 1), n(2.0)]), CellError::Num);
+    close_tol(ev("TBILLEQ", vec![d(2023, 1, 1), d(2023, 6, 30), n(1.0)]), 2.0277777777777777, 1e-12);
     close_tol(ev("ACCRINTM", vec![d(2008, 4, 1), d(2008, 6, 15), n(0.1), n(1000.0), n(3.0)]), 20.54794521, 1e-9);
     is_err(ev("ACCRINTM", vec![d(2008, 6, 15), d(2008, 4, 1), n(0.1)]), CellError::Num);
     close_tol(ev("ACCRINT", vec![d(2008, 3, 1), d(2008, 8, 31), d(2008, 5, 1), n(0.1), n(1000.0), n(2.0), n(0.0)]), 16.66666667, 1e-9);
@@ -190,11 +206,39 @@ fn securities() {
     close_tol(ev("YIELD", vec![d(2008, 2, 15), d(2008, 6, 15), n(0.05), n(pv), n(100.0), n(2.0)]), 0.04, 1e-9);
 }
 
+/// #4094: distinct dates can have zero 30/360 days between settlement and
+/// maturity; Excel returns a zero yield rather than #NUM!.
+#[test]
+fn yieldmat_zero_30_360_days_is_zero() {
+    close_tol(ev("YIELDMAT", vec![d(2025, 1, 30), d(2025, 1, 31), d(2025, 1, 29), n(0.05), n(100.0), n(4.0)]), 0.0, 0.0);
+    close_tol(ev("YIELDMAT", vec![d(2025, 1, 30), d(2025, 1, 31), d(2025, 1, 29), n(0.05), n(95.0), n(4.0)]), 0.0, 0.0);
+    close_tol(ev("YIELDMAT", vec![d(2025, 5, 30), d(2025, 5, 31), d(2025, 4, 30), n(0.05), n(100.0), n(0.0)]), 0.0, 0.0);
+    close_tol(ev("YIELDMAT", vec![d(2025, 5, 30), d(2025, 5, 31), d(2025, 4, 30), n(0.05), n(100.0), n(2.0)]), 0.04979253112033974, 1e-15);
+    // A non-positive price and equal dates stay errors.
+    is_err(ev("YIELDMAT", vec![d(2025, 1, 30), d(2025, 1, 31), d(2025, 1, 29), n(0.05), n(0.0), n(4.0)]), CellError::Num);
+    is_err(ev("YIELDMAT", vec![d(2025, 1, 30), d(2025, 1, 30), d(2025, 1, 29), n(0.05), n(100.0), n(4.0)]), CellError::Num);
+}
+
 fn number(v: Value) -> f64 {
     match v {
         Value::Number(x) => x,
         other => panic!("expected a number, got {other:?}"),
     }
+}
+
+/// A negative fractional basis is #NUM!, not truncation toward zero (#4058).
+#[test]
+fn negative_fractional_basis_is_rejected() {
+    let price = |basis: f64| ev("PRICE", vec![d(2024, 1, 15), d(2025, 6, 30), n(0.05), n(0.04), n(100.0), n(2.0), n(basis)]);
+    is_err(price(-0.9), CellError::Num);
+    is_err(ev("COUPDAYS", vec![d(2011, 1, 25), d(2011, 11, 15), n(2.0), n(-0.9)]), CellError::Num);
+    is_err(ev("PRICEMAT", vec![d(2008, 2, 15), d(2008, 4, 13), d(2007, 11, 11), n(0.061), n(0.061), n(-0.9)]), CellError::Num);
+    is_err(ev("ACCRINTM", vec![d(2008, 4, 1), d(2008, 6, 15), n(0.1), n(1000.0), n(-0.5)]), CellError::Num);
+    // Controls: a positive fraction still truncates to basis 0, and -1 is still #NUM!.
+    close_tol(price(0.9), 101.40114791702759, 1e-9);
+    close_tol(price(0.0), 101.40114791702759, 1e-9);
+    close(ev("COUPDAYS", vec![d(2011, 1, 25), d(2011, 11, 15), n(2.0), n(0.9)]), 180.0);
+    is_err(price(-1.0), CellError::Num);
 }
 
 #[test]
@@ -234,6 +278,20 @@ fn odd_periods() {
         ev("ODDFPRICE", first(0.0785, &[0.0625, 100.0, 2.0, 1.0]).into_iter().take(4).chain([t("x"), n(0.06), n(100.0), n(2.0)]).collect()),
         CellError::Value,
     );
+}
+
+#[test]
+fn odd_last_rejects_a_last_interest_before_the_first_maturity_anniversary_of_1900() {
+    // #4074: Excel returns #NUM! when the maturity-anchored coupon date on or before
+    // last_interest would fall before 1900 (serials 1 and 61 here); serial 180 still prices.
+    let price = |last: f64| ev("ODDLPRICE", vec![d(2023, 2, 1), d(2023, 4, 1), n(last), n(0.05), n(0.04), n(100.0), n(1.0), n(0.0)]);
+    let yld = |last: f64| ev("ODDLYIELD", vec![d(2023, 2, 1), d(2023, 4, 1), n(last), n(0.05), n(100.0), n(100.0), n(1.0), n(0.0)]);
+    for last in [1.0, 61.0] {
+        is_err(price(last), CellError::Num);
+        is_err(yld(last), CellError::Num);
+    }
+    close_tol(price(180.0), 96.10623620309059, 1e-10);
+    close_tol(yld(180.0), 0.007013032552159747, 1e-10);
 }
 
 #[test]

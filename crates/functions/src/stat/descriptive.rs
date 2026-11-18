@@ -210,6 +210,10 @@ pub(super) fn percentile_exc(v: Vec<f64>, k: f64) -> R<f64> {
 }
 
 pub(super) fn quartile_inc(v: Vec<f64>, q: f64) -> R<f64> {
+    // A negative quart is refused before truncating, so -0.1 doesn't become quartile 0 (#4279).
+    if q < 0.0 {
+        return Err(CellError::Num);
+    }
     let q = q.trunc();
     if !(0.0..=4.0).contains(&q) {
         return Err(CellError::Num);
@@ -363,12 +367,15 @@ pub(super) fn mode_mult(a: &[Arg], _: C) -> R<Value> {
     col_value(m)
 }
 
+// The rank is read before the data: when both hold an error, Excel returns the rank's (#4278).
 pub(super) fn large(a: &[Arg], _: C) -> R<Value> {
-    num_val(kth(arg_nums(a, 0)?, num(a, 1)?, true)?)
+    let k = num(a, 1)?;
+    num_val(kth(arg_nums(a, 0)?, k, true)?)
 }
 
 pub(super) fn small(a: &[Arg], _: C) -> R<Value> {
-    num_val(kth(arg_nums(a, 0)?, num(a, 1)?, false)?)
+    let k = num(a, 1)?;
+    num_val(kth(arg_nums(a, 0)?, k, false)?)
 }
 
 pub(super) fn rank_impl(a: &[Arg], avg: bool) -> R<Value> {
@@ -529,8 +536,10 @@ pub(super) fn prob(a: &[Arg], _: C) -> R<Value> {
     if ps.iter().any(|&p| p <= 0.0 || p > 1.0) {
         return Err(CellError::Num);
     }
+    // The weights must total 1 as Excel compares numbers, to 15 significant digits: binary noise
+    // (ten weights of 0.1) passes, a total of 1.00000001 or 0.99999999 is #NUM! (#4284).
     let total: f64 = ps.iter().sum();
-    if (total - 1.0).abs() > 1e-7 {
+    if gridcraft_core::compare_numbers(total, 1.0) != std::cmp::Ordering::Equal {
         return Err(CellError::Num);
     }
     num_val(xs.iter().zip(&ps).filter(|(x, _)| **x >= lo && **x <= hi).map(|(_, p)| p).sum())
@@ -569,10 +578,13 @@ fn aggregate_impl(function_num: u32, values: &[Value], k: Option<&Value>) -> R<V
     let code = if (101..=111).contains(&function_num) { function_num - 100 } else { function_num };
     let mut xs = Vec::new();
     let mut nonempty = 0usize;
+    // COUNT and COUNTA count an error instead of failing on it, as COUNT and COUNTA do: COUNT
+    // passes over it and COUNTA counts it as a nonempty cell (#4271).
+    let counting = matches!(code, 2 | 3);
     let mut push = |v: &Value| -> R<()> {
         match v {
             Value::Number(n) => xs.push(*n),
-            Value::Error(e) => return Err(*e),
+            Value::Error(e) if !counting => return Err(*e),
             _ => {}
         }
         if !v.is_empty() {

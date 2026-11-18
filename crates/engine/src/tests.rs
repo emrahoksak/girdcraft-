@@ -1067,6 +1067,26 @@ fn inserting_or_deleting_cells_cancels_copy_mode() {
 }
 
 #[test]
+fn autofill_refuses_an_invalid_source_instead_of_using_the_selection() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1:A2", "values": [[1], [3]]})).unwrap();
+    s.execute("selection.set", json!({"range": "A1:A2"})).unwrap();
+    let before = s.doc().unwrap().wb.clone();
+    let selection = s.doc().unwrap().selection.clone();
+    let history = s.execute("history.list", json!({})).unwrap();
+    for source in [json!("A0"), json!(null), json!(42), json!(true), json!([]), json!({})] {
+        let err = s.execute("edit.autoFill", json!({"source": &source, "target": "A1:A4"})).unwrap_err();
+        assert!(err.to_string().contains("`source`"), "{source}: {err}");
+        assert!(std::sync::Arc::ptr_eq(&before, &s.doc().unwrap().wb));
+        assert_eq!(s.doc().unwrap().selection, selection);
+        assert_eq!(s.execute("history.list", json!({})).unwrap(), history);
+        assert_eq!(v(&s, "A3"), Value::Empty);
+    }
+    s.execute("edit.autoFill", json!({"target": "A1:A4"})).unwrap();
+    assert_eq!(v(&s, "A4"), Value::Number(7.0), "omitting source still uses the selection");
+}
+
+#[test]
 fn fill_series() {
     let mut s = s();
     s.execute("range.setValues", json!({"range": "A1", "values": [[1], [3]]})).unwrap();
@@ -2080,6 +2100,70 @@ fn tables_and_structured_refs() {
     assert_eq!(v(&s, "B4"), Value::Number(7.0));
 }
 
+/// A table's Total Row turned on again shows what it held when it was turned off, as in Excel: a
+/// custom total is its formula (it was written as text), and the first column keeps its own
+/// label or function (it always became "Total").
+#[test]
+fn total_row_turned_on_again_restores_custom_totals_and_labels() {
+    use gridcraft_model::{Table, TableColumn, TotalsFn};
+    let col = |name: &str, totals: TotalsFn, label: Option<&str>| TableColumn {
+        name: name.into(),
+        totals,
+        totals_label: label.map(str::to_string),
+        formula: None,
+        unique_name: None,
+        xml: None,
+    };
+    let table = |columns: Vec<TableColumn>| Table {
+        id: 1,
+        name: "Table1".into(),
+        range: gridcraft_core::RangeRef::parse("A1:C3").unwrap(),
+        header_row: true,
+        totals_row: false,
+        columns,
+        style: "TableStyleMedium2".into(),
+        banded_rows: true,
+        banded_cols: false,
+        first_col: false,
+        last_col: false,
+        filter_button: true,
+        filter: vec![],
+        table_type: None,
+        connection_id: None,
+    };
+    // The table as a file holds it with its Total Row turned off, then the row turned on.
+    let opened = |t: Table| {
+        let mut s = self::s();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Group", "Amount", "Mean"], ["x", 7, 1], ["y", 8, 2]]})).unwrap();
+        std::sync::Arc::make_mut(&mut s.doc_mut().unwrap().wb).sheet_mut(0).unwrap().tables.push(t);
+        s.execute("table.totalRow", json!({"on": true, "table": "Table1"})).unwrap();
+        s
+    };
+    let formula_of = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap()["formula"].clone();
+    // #4296's table: a label, a custom formula and an Average.
+    let mut s = opened(table(vec![
+        col("Group", TotalsFn::None, Some("Total")),
+        col("Amount", TotalsFn::Custom, Some("SUM(B2:B3)+10")),
+        col("Mean", TotalsFn::Average, None),
+    ]));
+    assert_eq!(formula_of(&mut s, "B4"), json!("=SUM(B2:B3)+10"));
+    assert_eq!(v(&s, "B4"), Value::Number(25.0));
+    assert_eq!(v(&s, "C4"), Value::Number(1.5));
+    assert_eq!(v(&s, "A4"), Value::text("Total"));
+    // The first column keeps a label of its own, or its function.
+    let s =
+        opened(table(vec![col("Group", TotalsFn::None, Some("All groups")), col("Amount", TotalsFn::Sum, None), col("Mean", TotalsFn::None, None)]));
+    assert_eq!(v(&s, "A4"), Value::text("All groups"));
+    let s = opened(table(vec![col("Group", TotalsFn::Count, None), col("Amount", TotalsFn::Sum, None), col("Mean", TotalsFn::None, None)]));
+    assert_eq!(v(&s, "A4"), Value::Number(2.0));
+    // A table that never had a total row still gets "Total" and a Sum of its last column.
+    let mut s = self::s();
+    s.execute("range.setValues", json!({"range": "A1", "values": [["Item", "Qty"], ["x", 2], ["y", 5]]})).unwrap();
+    s.execute("insert.table", json!({"range": "A1:B3"})).unwrap();
+    s.execute("table.totalRow", json!({"on": true, "table": "Table1"})).unwrap();
+    assert_eq!((v(&s, "A4"), v(&s, "B4")), (Value::text("Total"), Value::Number(7.0)));
+}
+
 #[test]
 fn structured_refs_to_columns_with_edge_spaces() {
     let mut s = s();
@@ -2862,6 +2946,104 @@ fn ods_import_never_reuses_source_as_save_target() {
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         s.execute("file.open", json!({"name": "converted.xlsx", "base64": crate::io::base64_encode(&std::fs::read(output).unwrap())})).unwrap();
         assert_eq!(v(&s, "A1"), Value::Number(43.0));
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// #4350: a workbook package opened from a file named `.csv`, `.tsv`, `.html` or `.pdf` is saved
+/// back as that package by an ordinary Save, not replaced by a one-sheet text or PDF copy. A path
+/// named explicitly still goes by its extension.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn ordinary_save_keeps_a_workbook_opened_under_another_extension() {
+    let nonce = unique_nonce();
+    let dir = std::env::temp_dir().join(format!("gridcraft-misnamed-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let seed = dir.join("seed.xlsx");
+    let mut s = self::s();
+    s.execute("cell.set", json!({"cell": "A1", "input": "FIRST"})).unwrap();
+    s.execute("home.insertSheet", json!({"name": "Second"})).unwrap();
+    s.execute("cell.set", json!({"cell": "A1", "input": "SECOND"})).unwrap();
+    s.execute("file.saveAs", json!({"path": seed})).unwrap();
+    let seed_bytes = std::fs::read(&seed).unwrap();
+    let sheets_of = |bytes: &[u8]| {
+        assert_eq!(gridcraft_xlsx::sniff(bytes), gridcraft_xlsx::Format::Xlsx, "still a workbook package");
+        let (wb, _) = crate::io::open_bytes("check.xlsx", bytes).unwrap();
+        wb.sheets.iter().map(|sh| (sh.name.clone(), sh.value(gridcraft_core::CellRef::new(0, 0)))).collect::<Vec<_>>()
+    };
+    let both = sheets_of(&seed_bytes);
+    assert_eq!(both.len(), 2);
+    for ext in ["csv", "tsv", "html", "pdf", "CSV"] {
+        let path = dir.join(format!("workbook.{ext}"));
+        std::fs::write(&path, &seed_bytes).unwrap();
+        let mut s = self::s();
+        s.execute("file.open", json!({"path": path})).unwrap();
+        s.execute("cell.set", json!({"cell": "B1", "input": "edited"})).unwrap();
+        s.execute("file.save", json!({})).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        let sheets = sheets_of(&saved);
+        assert_eq!(sheets.len(), 2, "{ext}: both sheets kept");
+        assert_eq!(sheets.iter().map(|(n, v)| (n.clone(), v.clone())).collect::<Vec<_>>(), both, "{ext}");
+        assert!(!s.active().unwrap().is_dirty(), "{ext}: the save is the document's own");
+    }
+    // A path named explicitly is a choice of format: Save As to the same `.csv` writes CSV.
+    let path = dir.join("named.csv");
+    std::fs::write(&path, &seed_bytes).unwrap();
+    let mut s = self::s();
+    s.execute("file.open", json!({"path": path})).unwrap();
+    s.execute("file.saveAs", json!({"path": path})).unwrap();
+    assert_ne!(gridcraft_xlsx::sniff(&std::fs::read(&path).unwrap()), gridcraft_xlsx::Format::Xlsx);
+    // A Save As in a full-fidelity format makes that file the document's own, in its own format:
+    // the next ordinary Save writes JSON to `book.json`, and a package to `book.xlsx`.
+    for (ext, check) in [("json", false), ("xlsx", true)] {
+        let path = dir.join("again.csv");
+        std::fs::write(&path, &seed_bytes).unwrap();
+        let mut s = self::s();
+        s.execute("file.open", json!({"path": path})).unwrap();
+        let moved = dir.join(format!("book.{ext}"));
+        s.execute("file.saveAs", json!({"path": moved})).unwrap();
+        s.execute("cell.set", json!({"cell": "C1", "input": "later"})).unwrap();
+        s.execute("file.save", json!({})).unwrap();
+        let saved = std::fs::read(&moved).unwrap();
+        assert_eq!(gridcraft_xlsx::sniff(&saved) == gridcraft_xlsx::Format::Xlsx, check, "{ext}: saved in its own format");
+        let (wb, _) = crate::io::open_bytes(&format!("check.{ext}"), &saved).unwrap();
+        assert_eq!(wb.sheets.len(), 2, "{ext}");
+        assert!(!s.active().unwrap().is_dirty(), "{ext}");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+/// #4355: an export path whose extension names the format, in any case or spelling, is written as
+/// given; any other path gets the format's extension.
+#[test]
+#[cfg(not(target_arch = "wasm32"))]
+fn exports_keep_a_path_whose_extension_names_the_format() {
+    let nonce = unique_nonce();
+    let dir = std::env::temp_dir().join(format!("gridcraft-export-ext-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let mut s = s();
+    s.execute("cell.set", json!({"cell": "A1", "input": "visible"})).unwrap();
+    for (cmd, name, written) in [
+        ("file.exportHtml", "page.htm", "page.htm"),
+        ("file.exportHtml", "page.HTML", "page.HTML"),
+        ("file.exportHtml", "page.Htm", "page.Htm"),
+        ("file.exportHtml", "page.html", "page.html"),
+        ("file.exportHtml", "page", "page.html"),
+        ("file.exportHtml", "page.csv", "page.csv.html"),
+        ("file.exportCsv", "data.CSV", "data.CSV"),
+        ("file.exportCsv", "data.csv", "data.csv"),
+        ("file.exportCsv", "data", "data.csv"),
+        ("file.exportCsv", "data.htm", "data.htm.csv"),
+        ("file.exportCsv", "data.txt", "data.txt.csv"),
+    ] {
+        let out = s.execute(cmd, json!({"path": dir.join(name)})).unwrap();
+        let expected = dir.join(written);
+        assert_eq!(out["path"].as_str(), expected.to_str(), "{cmd} {name}");
+        assert!(std::fs::read_to_string(&expected).unwrap().contains("visible"), "{cmd} {name}");
+    }
+    // Nothing was written under a doubled extension.
+    for doubled in ["page.htm.html", "page.HTML.html", "data.CSV.csv"] {
+        assert!(!dir.join(doubled).exists(), "{doubled}");
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -5999,6 +6181,30 @@ fn paste_that_does_not_fit_on_the_sheet_is_refused() {
     assert_eq!(v(&s, "A20"), Value::Text("x".into()));
 }
 
+#[test]
+fn paste_special_refuses_unknown_operations_without_changing_the_destination() {
+    let mut s = s();
+    s.execute("range.setValues", json!({"range": "A1:B1", "values": [[2, 10]]})).unwrap();
+    s.execute("edit.copy", json!({"range": "A1"})).unwrap();
+    let history = s.execute("history.list", json!({})).unwrap();
+    let clipboard = s.clipboard.clone().unwrap();
+    for operation in ["multipy", "ADD", ""] {
+        let err = s.execute("edit.pasteSpecial", json!({"what": "values", "at": "B1", "operation": operation})).unwrap_err();
+        assert!(err.to_string().contains("unknown `operation`"), "{operation}: {err}");
+        assert_eq!(v(&s, "B1"), Value::Number(10.0));
+        assert_eq!(s.execute("history.list", json!({})).unwrap(), history);
+        let kept = s.clipboard.as_ref().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&kept.wb, &clipboard.wb));
+        assert_eq!((&kept.text, kept.range, kept.cut), (&clipboard.text, clipboard.range, clipboard.cut));
+    }
+    s.execute("edit.pasteSpecial", json!({"what": "values", "at": "B1", "operation": "add"})).unwrap();
+    assert_eq!(v(&s, "B1"), Value::Number(12.0));
+    s.execute("edit.pasteSpecial", json!({"what": "values", "at": "B1", "operation": "none"})).unwrap();
+    assert_eq!(v(&s, "B1"), Value::Number(2.0));
+    s.execute("edit.pasteSpecial", json!({"what": "values", "at": "C1"})).unwrap();
+    assert_eq!(v(&s, "C1"), Value::Number(2.0));
+}
+
 /// Paste visits only cells that hold something on either side: a blank copied cell still clears
 /// (or reformats) a destination cell that holds something, and blank onto blank stays blank, even
 /// with an operation (Excel leaves it empty rather than writing 0).
@@ -7069,4 +7275,25 @@ fn history_charges_the_storage_of_empty_comment_replies() {
     let sheet = s.doc().unwrap().wb.sheet(0).unwrap().clone();
     // 500 replies of no text are still 500 elements.
     assert!(crate::sheet_text_bytes(&sheet) >= 500 * std::mem::size_of::<(String, String)>());
+}
+
+/// #4416: Command Search shows each command's own label, so the labels follow the feature names
+/// (`docs/feature-names.md`): Decorative Text, not WordArt; Diagram, not SmartArt. The command ids
+/// stay as they are.
+#[test]
+fn command_labels_use_the_feature_names() {
+    let s = Session::new();
+    let commands = s.commands();
+    let label = |id: &str| commands.iter().find(|c| c.id == id).map(|c| c.label.to_string());
+    assert_eq!(label("insert.wordArt").as_deref(), Some("Decorative Text"));
+    assert_eq!(label("wordArt.set").as_deref(), Some("Format Decorative Text"));
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    for c in &commands {
+        for retired in ["WordArt", "SmartArt"] {
+            let named = c.label.match_indices(retired).any(|(at, _)| {
+                !c.label[..at].chars().next_back().is_some_and(word) && !c.label[at + retired.len()..].chars().next().is_some_and(word)
+            });
+            assert!(!named, "{}: {}", c.id, c.label);
+        }
+    }
 }

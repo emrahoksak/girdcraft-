@@ -1458,6 +1458,46 @@ fn subtotal_and_aggregate_cap_cells_visited() {
     assert_eq!((t.num("E5"), t.num("E6"), t.num("E7")), (3.0, 3.0, 2.0));
 }
 
+/// Native Excel (#4277): AGGREGATE 14-19 answer #VALUE! when k is an error reached through a
+/// reference (a cell, a name, INDEX, INDIRECT), even with an error in the data too; a computed
+/// error k (`NA()`, `E1+0`) stays itself.
+#[test]
+fn aggregate_k_error_through_a_reference_is_value() {
+    let mut t = T::new();
+    for (at, v) in [("A1", "10"), ("A2", "20"), ("A3", "30"), ("A4", "40"), ("E1", "=NA()"), ("E3", "=1/0"), ("E4", "2")] {
+        t.set(at, v);
+    }
+    t.set("C1", "10");
+    t.set("C2", "=1/0");
+    t.wb.names.push(gridcraft_model::DefinedName {
+        name: "ErrorCell".into(),
+        scope: None,
+        formula: "Sheet1!$E$1".into(),
+        comment: String::new(),
+        hidden: false,
+    });
+    let value = Value::Error(CellError::Value);
+    let rows: [(&str, Value); 12] = [
+        ("=AGGREGATE(14,6,A1:A4,E1)", value.clone()),
+        ("=AGGREGATE(15,6,A1:A4,E3)", value.clone()),
+        ("=AGGREGATE(19,6,A1:A4,E1)", value.clone()),
+        ("=AGGREGATE(14,6,A1:A4,ErrorCell)", value.clone()),
+        ("=AGGREGATE(14,6,A1:A4,INDEX(E1:E2,1))", value.clone()),
+        ("=AGGREGATE(14,6,A1:A4,INDIRECT(\"E1\"))", value.clone()),
+        ("=AGGREGATE(14,4,C1:C2,E1)", value.clone()),
+        ("=AGGREGATE(14,6,A1:A4,E1+0)", Value::Error(CellError::NA)),
+        ("=AGGREGATE(14,6,A1:A4,NA())", Value::Error(CellError::NA)),
+        ("=AGGREGATE(15,6,A1:A4,INDEX(E3:E4,1)+0)", Value::Error(CellError::Div0)),
+        ("=AGGREGATE(14,6,A1:A4,E4)", Value::Number(30.0)),
+        ("=AGGREGATE(14,6,A1:A4,2)", Value::Number(30.0)),
+    ];
+    for (i, (f, want)) in rows.into_iter().enumerate() {
+        let at = format!("G{}", i + 1);
+        t.set(&at, f);
+        assert_eq!(t.get(&at), want, "{f}");
+    }
+}
+
 /// SUBTOTAL leaves out rows a filter hides for every function number, while 1-11 keep rows
 /// hidden by hand (as in ConditionalFormattingSamples.xlsx, where `SUBTOTAL(9,Table69[Sales])`
 /// under a filtered table adds only the visible rows).
@@ -1937,6 +1977,21 @@ fn blank_lookup_values_match_excel_windows_observation() {
         t.set(at, f);
         assert_eq!(t.get(at), want, "{f}");
     }
+}
+
+#[test]
+fn written_blank_lookup_argument_is_numeric_zero() {
+    // #4044: `XMATCH(, array)` writes a blank argument, which Excel reads as numeric zero. Only a
+    // reference to a blank cell (B1 here) is a blank lookup value.
+    let mut t = T::new();
+    t.set("A1", "=XMATCH(,{0,1,3})");
+    t.set("A2", "=XMATCH(B1,{0,1,3})");
+    t.set("A3", "=XLOOKUP(,{0,1,3},{10,20,30})");
+    t.set("A4", "=XLOOKUP(B1,{0,1,3},{10,20,30},\"none\")");
+    assert_eq!(t.get("A1"), Value::Number(1.0));
+    assert_eq!(t.get("A2"), Value::Error(CellError::NA));
+    assert_eq!(t.get("A3"), Value::Number(10.0));
+    assert_eq!(t.get("A4"), Value::from("none"));
 }
 
 #[test]
@@ -3138,4 +3193,38 @@ fn computed_criterion_that_reenters_itself_is_not_met() {
     t.set("N47", "=DCOUNT($F$2:$G$7,\"age\",$N$46:$N$47)>0");
     t.set("B60", "=DCOUNT($F$2:$G$7,\"age\",N46:N47)");
     assert_eq!(t.num("B60"), 0.0);
+}
+
+/// Native Excel (#4270): AGGREGATE's options run 0 to 7. A fraction inside the range truncates
+/// (7.9 is 7), and anything outside it, -0.5 included, is #VALUE!, typed, as text or from a cell.
+#[test]
+fn aggregate_refuses_options_outside_0_to_7() {
+    let mut t = T::new();
+    for (at, v) in [("A1", "10"), ("A2", "20"), ("C1", "-1"), ("C2", "8"), ("C3", "7")] {
+        t.set(at, v);
+    }
+    let value = Value::Error(CellError::Value);
+    let rows: [(&str, Value); 16] = [
+        ("=AGGREGATE(9,8,A1:A2)", value.clone()),
+        ("=AGGREGATE(9,9,A1:A2)", value.clone()),
+        ("=AGGREGATE(9,-1,A1:A2)", value.clone()),
+        ("=AGGREGATE(9,-0.5,A1:A2)", value.clone()),
+        ("=AGGREGATE(9,\"8\",A1:A2)", value.clone()),
+        ("=AGGREGATE(9,C1,A1:A2)", value.clone()),
+        ("=AGGREGATE(9,C2,A1:A2)", value.clone()),
+        ("=AGGREGATE(14,8,A1:A2,1)", value.clone()),
+        ("=AGGREGATE(14,-1,A1:A2,1)", value.clone()),
+        ("=AGGREGATE(9,7,A1:A2)", Value::Number(30.0)),
+        ("=AGGREGATE(9,7.9,A1:A2)", Value::Number(30.0)),
+        ("=AGGREGATE(9,0.5,A1:A2)", Value::Number(30.0)),
+        ("=AGGREGATE(9,6.9,A1:A2)", Value::Number(30.0)),
+        ("=AGGREGATE(9,0,A1:A2)", Value::Number(30.0)),
+        ("=AGGREGATE(9,C3,A1:A2)", Value::Number(30.0)),
+        ("=AGGREGATE(14,7,A1:A2,1)", Value::Number(20.0)),
+    ];
+    for (i, (f, want)) in rows.into_iter().enumerate() {
+        let at = format!("E{}", i + 1);
+        t.set(&at, f);
+        assert_eq!(t.get(&at), want, "{f}");
+    }
 }

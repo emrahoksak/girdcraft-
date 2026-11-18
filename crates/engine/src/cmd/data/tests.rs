@@ -16,6 +16,33 @@ fn filter_blanks_include_empty_text_and_formula_results() {
 }
 
 #[test]
+fn subtotal_rejects_unknown_functions_before_changing_the_sheet() {
+    for (function, expected) in [(Some("average"), 15.0), (Some("sum"), 30.0), (None, 30.0)] {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1:B3", "values": [["Region", "Sales"], ["East", 10], ["East", 20]]})).unwrap();
+        let before = s.doc().unwrap().wb.clone();
+        let selection = s.doc().unwrap().selection.clone();
+        let history = s.execute("history.list", json!({})).unwrap();
+        let mut params = json!({"range": "A1:B3", "groupBy": "A", "columns": ["B"]});
+        for invalid in ["averag", ""] {
+            params["function"] = json!(invalid);
+            let err = s.execute("data.subtotal", params.clone()).unwrap_err();
+            assert!(err.to_string().contains("unknown `function`"), "{invalid}: {err}");
+            assert!(Arc::ptr_eq(&s.doc().unwrap().wb, &before));
+            assert_eq!(s.doc().unwrap().selection, selection);
+            assert_eq!(s.execute("history.list", json!({})).unwrap(), history);
+        }
+        params.as_object_mut().unwrap().remove("function");
+        if let Some(function) = function {
+            params["function"] = json!(function);
+        }
+        s.execute("data.subtotal", params).unwrap();
+        assert_eq!(s.doc().unwrap().wb.active().unwrap().value(CellRef::new(3, 1)), Value::Number(expected));
+    }
+}
+
+#[test]
 fn subtotal_honours_header_false() {
     // #131: with header:false the first data row was treated as a header and left out of its
     // group's subtotal and the grand total.
@@ -29,6 +56,34 @@ fn subtotal_honours_header_false() {
     assert_eq!(get(&mut s, "B3")["value"], json!(30.0), "East's subtotal counts both East rows");
     assert_eq!(get(&mut s, "A7")["text"], json!("Grand Total"));
     assert_eq!(get(&mut s, "B7")["value"], json!(100.0), "the grand total counts every data row");
+}
+
+/// #4268: the grand total's range ends at the last data row, as Excel writes it, so a value
+/// typed over the last group's total doesn't change the grand total, as one typed over any other
+/// group's total doesn't.
+#[test]
+fn subtotal_grand_total_ends_at_the_last_data_row() {
+    // (function, SUBTOTAL code, label, grand total, after B6 = 100, after B6 = =50+50, after B4 = 100)
+    for (function, code, label, steps) in
+        [("sum", 9, "Total", [60.0, 60.0, 60.0, 160.0]), ("count", 3, "Count", [3.0, 3.0, 3.0, 4.0]), ("max", 4, "Max", [30.0, 30.0, 30.0, 100.0])]
+    {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "A1", "values": [["Group", "Amount"], ["A", 10], ["A", 20], ["B", 30]]})).unwrap();
+        s.execute("data.subtotal", json!({"range": "A1:B4", "groupBy": "A", "columns": ["B"], "function": function})).unwrap();
+        let get = |s: &mut Session, a: &str| s.execute("cell.get", json!({"cell": a})).unwrap();
+        assert_eq!(get(&mut s, "A7")["text"], json!(format!("Grand {label}")));
+        assert_eq!(get(&mut s, "B4")["formula"], json!(format!("=SUBTOTAL({code},B2:B3)")), "{function}");
+        assert_eq!(get(&mut s, "B6")["formula"], json!(format!("=SUBTOTAL({code},B5)")), "{function}");
+        assert_eq!(get(&mut s, "B7")["formula"], json!(format!("=SUBTOTAL({code},B2:B5)")), "{function}");
+        assert_eq!(get(&mut s, "B7")["value"], json!(steps[0]), "{function}");
+        // A value over the last group's total doesn't reach the grand total, as one over the
+        // first group's total does (it isn't a nested SUBTOTAL any more), in both apps.
+        for ((cell, input), want) in [("B6", "100"), ("B6", "=50+50"), ("B4", "100")].into_iter().zip(&steps[1..]) {
+            s.execute("cell.set", json!({"cell": cell, "input": input})).unwrap();
+            assert_eq!(get(&mut s, "B7")["value"], json!(want), "{function}: {cell} = {input}");
+        }
+    }
 }
 
 #[test]
@@ -277,6 +332,30 @@ fn show_levels_collapses_and_expands_to_a_level() {
 }
 
 #[test]
+fn invalid_outline_ranges_do_not_fall_back_to_the_selection() {
+    let mut s = Session::new();
+    s.new_workbook();
+    s.execute("selection.set", json!({"range": "A2:A3"})).unwrap();
+    let before = s.doc().unwrap().wb.clone();
+    let selection = s.doc().unwrap().selection.clone();
+    let history = s.execute("history.list", json!({})).unwrap();
+    for command in ["data.group", "data.ungroup", "data.hideDetail", "data.showDetail"] {
+        for params in [json!({"rows": "0:0"}), json!({"cols": "not a range"})] {
+            let err = s.execute(command, params).unwrap_err();
+            assert!(matches!(err, EngineError::BadParams { .. }), "{command}: {err}");
+            assert!(Arc::ptr_eq(&s.doc().unwrap().wb, &before));
+            assert_eq!(s.doc().unwrap().selection, selection);
+            assert_eq!(s.execute("history.list", json!({})).unwrap(), history);
+        }
+    }
+    // Valid cell ranges and the omitted-range selection fallback stay supported.
+    s.execute("data.group", json!({"rows": "B2:C3"})).unwrap();
+    s.execute("data.group", json!({})).unwrap();
+    let sh = s.doc().unwrap().wb.active().unwrap();
+    assert!((1..=2).all(|r| sh.rows.get(&r).is_some_and(|l| l.outline == 2)));
+}
+
+#[test]
 fn group_by_columns_for_a_block_of_cells() {
     let mut s = Session::new();
     s.new_workbook();
@@ -431,6 +510,85 @@ fn remove_duplicates_without_a_valid_column_is_refused() {
     let sh = s.doc().unwrap().wb.active().unwrap();
     assert_eq!(sh.value(CellRef::new(0, 0)), Value::text("a"));
     assert_eq!(sh.value(CellRef::new(2, 0)), Value::text("c"));
+}
+
+/// #3734: a kept row that moves up takes its formulas' relative references with it, as in
+/// Excel: `=B4*2` on the row moved to row 3 reads `=B3*2`, so it still doubles its own amount.
+#[test]
+fn remove_duplicates_moves_relative_references_with_their_rows() {
+    let mut s = Session::new();
+    s.new_workbook();
+    let rows = json!([
+        ["Key", "Amount", "Double", "Fixed"],
+        ["a", 10, "=B2*2", "=$B$2"],
+        ["a", 99, "=B3*2", "=$B$2"],
+        ["b", 20, "=B4*2", "=$B$2"],
+        ["c", 30, "=B5*2", "=$B$2"]
+    ]);
+    s.execute("range.setValues", json!({"range": "A1", "values": rows})).unwrap();
+    s.execute("data.removeDuplicates", json!({"range": "A1:D5", "columns": ["A"], "header": true})).unwrap();
+    let sh = s.doc().unwrap().wb.active().unwrap();
+    let formula = |r: u32, c: u32| sh.cell(CellRef::new(r, c)).and_then(|cell| cell.formula.as_ref()).map(|f| f.text.clone());
+    for (row, text, value) in [(1, "B2*2", 20.0), (2, "B3*2", 40.0), (3, "B4*2", 60.0)] {
+        assert_eq!(formula(row, 2).as_deref(), Some(text), "row {}", row + 1);
+        assert_eq!(sh.value(CellRef::new(row, 2)), Value::Number(value), "row {}", row + 1);
+        // An absolute reference stays where it points.
+        assert_eq!(formula(row, 3).as_deref(), Some("$B$2"), "row {}", row + 1);
+    }
+    assert_eq!(sh.value(CellRef::new(4, 2)), Value::Empty, "the freed last row is cleared");
+}
+
+#[test]
+fn remove_duplicates_rejects_each_malformed_column_without_changes() {
+    let mut s = Session::new();
+    s.new_workbook();
+    s.execute("range.setValues", json!({"range": "B1", "values": [["same", 1], ["same", 2]]})).unwrap();
+    s.execute("cell.set", json!({"cell": "E5", "input": "temporary"})).unwrap();
+    s.execute("edit.undo", json!({})).unwrap();
+    s.execute("selection.set", json!({"range": "G4:H5"})).unwrap();
+    let d = s.doc().unwrap();
+    assert!(!d.redo.is_empty());
+    let wb = d.wb.clone();
+    let selection = d.selection.clone();
+    let history = (d.undo.len(), d.redo.len());
+    let dirty = d.is_dirty();
+    for invalid in [json!("???"), json!(null), json!(true), json!(-1), json!(0.5), json!([]), json!({}), json!(u64::MAX)] {
+        // Silently dropping the invalid entry compares only B and deletes the distinct second row.
+        let err = s.execute("data.removeDuplicates", json!({"range": "B1:C2", "header": false, "columns": ["B", invalid]})).unwrap_err();
+        assert!(matches!(err, EngineError::BadParams { .. }), "{err:?}");
+        assert!(err.to_string().contains("columns"), "{err}");
+        let d = s.doc().unwrap();
+        assert!(Arc::ptr_eq(&d.wb, &wb), "the workbook must not change");
+        assert_eq!(d.selection, selection);
+        assert_eq!((d.undo.len(), d.redo.len()), history);
+        assert_eq!(d.is_dirty(), dirty);
+    }
+}
+
+#[test]
+fn remove_duplicates_keeps_valid_named_and_relative_columns() {
+    for (columns, removed) in [
+        (Some(json!(["B", "C"])), 0),
+        (Some(json!(["$B", "$C"])), 0),
+        (Some(json!([0, 1])), 0),
+        (Some(json!(["B"])), 1),
+        (Some(json!([0])), 1),
+        (None, 0),
+    ] {
+        let mut s = Session::new();
+        s.new_workbook();
+        s.execute("range.setValues", json!({"range": "B1", "values": [["same", 1], ["same", 2]]})).unwrap();
+        let mut params = json!({"range": "B1:C2", "header": false});
+        if let Some(columns) = columns {
+            params["columns"] = columns;
+        }
+        let result = s.execute("data.removeDuplicates", params).unwrap();
+        assert_eq!(result, json!({"removed": removed, "remaining": 2 - removed}));
+        let sh = s.doc().unwrap().wb.active().unwrap();
+        assert_eq!(sh.value(CellRef::new(0, 2)).display(), "1");
+        assert_eq!(sh.value(CellRef::new(1, 1)).display(), if removed == 0 { "same" } else { "" });
+        assert_eq!(sh.value(CellRef::new(1, 2)).display(), if removed == 0 { "2" } else { "" });
+    }
 }
 
 #[test]
