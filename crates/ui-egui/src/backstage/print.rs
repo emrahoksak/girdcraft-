@@ -15,16 +15,25 @@ pub(super) fn print(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &m
     // override (see `layouts()`) only ever applies to the active sheet anyway, so "all" + a
     // selection range wouldn't mean anything coherent.
     let selection_a1 = app.session.active().map(|d| {
-        d.selection.ranges.iter().copied().reduce(|a, b| a.union(&b)).unwrap_or_else(|| gridcraft_engine::core::RangeRef::cell(d.selection.active)).a1()
+        d.selection
+            .ranges
+            .iter()
+            .copied()
+            .reduce(|a, b| a.union(&b))
+            .unwrap_or_else(|| gridcraft_engine::core::RangeRef::cell(d.selection.active))
+            .a1()
     });
     let mut params = json!({"sheets": if bs.print_scope == PrintScope::EntireWorkbook { "all" } else { "active" }});
-    if bs.print_scope == PrintScope::Selection && let Some(range) = &selection_a1 {
+    if bs.print_scope == PrintScope::Selection
+        && let Some(range) = &selection_a1
+    {
         params["range"] = json!(range);
     }
     if bs.fit_to_page {
         params["fitToPage"] = json!(true);
     }
-    let key = (uid, revision, bs.print_scope, selection_a1.clone().filter(|_| bs.print_scope == PrintScope::Selection).unwrap_or_default(), bs.fit_to_page);
+    let key =
+        (uid, revision, bs.print_scope, selection_a1.clone().filter(|_| bs.print_scope == PrintScope::Selection).unwrap_or_default(), bs.fit_to_page);
     if bs.preview.as_ref().is_none_or(|(k, _)| *k != key) {
         let preview = app.session.run("file.printPreview", params.clone()).unwrap_or(Json::Null);
         bs.preview = Some((key, preview));
@@ -53,9 +62,11 @@ pub(super) fn print(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &m
                 .width(230.0)
                 .selected_text(lang.tr(scope))
                 .show_ui(ui, |ui| {
-                    for (value, label) in
-                        [(PrintScope::ActiveSheets, "Print Active Sheets"), (PrintScope::EntireWorkbook, "Print Entire Workbook"), (PrintScope::Selection, "Print Selection")]
-                    {
+                    for (value, label) in [
+                        (PrintScope::ActiveSheets, "Print Active Sheets"),
+                        (PrintScope::EntireWorkbook, "Print Entire Workbook"),
+                        (PrintScope::Selection, "Print Selection"),
+                    ] {
                         if ui.selectable_label(bs.print_scope == value, lang.tr(label)).clicked() {
                             bs.print_scope = value;
                             bs.preview_page = 0;
@@ -69,11 +80,7 @@ pub(super) fn print(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &m
             // Layout ribbon tab), but Print itself never offered a quick way to flip it without
             // leaving the print preview -- Excel's own Print screen has this right next to the
             // other quick settings, so this mirrors it instead of only living on the ribbon.
-            let landscape = app
-                .session
-                .active()
-                .and_then(|d| d.wb.active())
-                .is_some_and(|s| s.print.orientation != Default::default()); // default is Portrait
+            let landscape = app.session.active().and_then(|d| d.wb.active()).is_some_and(|s| s.print.orientation != Default::default()); // default is Portrait
             let orientation_label = if landscape { "Landscape Orientation" } else { "Portrait Orientation" };
             craft_ui::ComboBox::from_id_salt("backstage_print_orientation")
                 .width(230.0)
@@ -97,8 +104,7 @@ pub(super) fn print(app: &mut SheetApp, ui: &mut Ui, bs: &mut Backstage, out: &m
             // Gridlines > Print checkbox) -- same reasoning as Orientation above: Excel's Page
             // Setup dialog has a Gridlines checkbox right on its Sheet tab, so this gives it a
             // home next to the other print-affecting settings instead of ribbon-only.
-            let mut print_gridlines =
-                app.session.active().and_then(|d| d.wb.active()).is_some_and(|s| s.print.gridlines);
+            let mut print_gridlines = app.session.active().and_then(|d| d.wb.active()).is_some_and(|s| s.print.gridlines);
             if ui.checkbox(&mut print_gridlines, lang.tr("Print Gridlines")).changed() {
                 app.run_or_alert("pageLayout.printGridlines", json!({"on": print_gridlines}));
                 bs.preview_page = 0;

@@ -460,13 +460,7 @@ impl Dialog {
                 let mut values = params.clone();
                 values["password"] = json!("");
                 let note = app.ui.language.tr_fill("'{file}' is protected.", &[("file", &file)]);
-                Dialog::form(
-                    "openPassword",
-                    "Password",
-                    "file.open",
-                    vec![Note(note), Password { key: "password", label: "Password:" }],
-                    values,
-                )
+                Dialog::form("openPassword", "Password", "file.open", vec![Note(note), Password { key: "password", label: "Password:" }], values)
             }
             "unprotectSheet" => Dialog::form(
                 "unprotectSheet",

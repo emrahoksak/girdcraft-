@@ -130,7 +130,7 @@ pub(super) fn list_picker(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_
 
     let anchor = sh.merge_at(c).map(|m| m.start).unwrap_or(c);
     let r = geo.range_rect(sh, sh.merge_at(c).unwrap_or(RangeRef::cell(c)));
-    
+
     // Fit the popup to its rows (up to LIST_PICKER_MAX_ROWS); without a minimum the scroll area collapses to its 64 px default.
     let height = list_picker_height(items.len(), LIST_PICKER_ROW_H, ui.spacing().item_spacing.y);
     // Open below the cell, or above it when the rows would run past the bottom of the window (as Excel does).
