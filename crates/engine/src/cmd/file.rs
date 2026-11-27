@@ -48,7 +48,7 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         (str_param(p, "name").unwrap_or("Book.xlsx").to_string(), crate::io::base64_decode(b).ok_or_else(|| bad("file.open", "invalid base64"))?)
     } else if let Some(path) = str_param(p, "path") {
         // Already open? Switch to it.
-        if let Some(i) = s.documents().iter().position(|d| d.path.as_deref() == Some(path)) {
+        if let Some(i) = s.documents().iter().position(|d| d.path.as_deref().is_some_and(|other| same_file(other, path))) {
             s.set_active(i);
             return Ok(json!({"index": i, "alreadyOpen": true}));
         }
@@ -57,7 +57,8 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         s.ui_requests.push(crate::UiRequest::Dialog("open".into(), json!({})));
         return ok();
     };
-    let encrypted = gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Encrypted;
+    let format = gridcraft_xlsx::sniff(&bytes);
+    let encrypted = format == gridcraft_xlsx::Format::Encrypted;
     let (mut wb, warnings) = crate::io::open_bytes_with(&name, &bytes, str_param(p, "password"), bool_param(p, "csvAsText").unwrap_or(false))?;
     // A password to modify: the right one or a read-only open, or the workbook doesn't open.
     let mut read_only = false;
@@ -80,9 +81,13 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
         Some(path) => crate::io::source_path(path),
         None => Some(std::path::PathBuf::from(&name)),
     };
-    let imported =
-        matches!(crate::io::FileKind::from_path(&name), Some(crate::io::FileKind::Ods | crate::io::FileKind::Xlsb | crate::io::FileKind::Xls))
-            || matches!(gridcraft_xlsx::sniff(&bytes), gridcraft_xlsx::Format::Ods | gridcraft_xlsx::Format::Xlsb | gridcraft_xlsx::Format::Xls);
+    let xlsx_only = bool_param(p, "xlsxWorkbook").unwrap_or(false);
+    // Warnings can describe workbook parts the reader skipped; preserve that original too.
+    let xlsx_source =
+        format == gridcraft_xlsx::Format::Xlsx && crate::io::path_has_extension(&name, "xlsx") && wb.vba_project.is_none() && warnings.is_empty();
+    let imported = (xlsx_only && !xlsx_source && !encrypted)
+        || matches!(crate::io::FileKind::from_path(&name), Some(crate::io::FileKind::Ods | crate::io::FileKind::Xlsb | crate::io::FileKind::Xls))
+        || matches!(format, gridcraft_xlsx::Format::Ods | gridcraft_xlsx::Format::Xlsb | gridcraft_xlsx::Format::Xls);
     let title = if imported {
         format!("{} (imported).xlsx", std::path::Path::new(&name).file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("Book"))
     } else {
@@ -94,16 +99,18 @@ fn open(s: &mut Session, p: &Json) -> Result<Json> {
     let path = str_param(p, "path").filter(|_| !imported && !encrypted && !read_only).map(str::to_string);
     // Replace an untouched blank Book1 like Excel does.
     if s.documents().len() == 1
-        && s.active().is_some_and(|d| d.path.is_none() && !d.is_dirty() && d.undo.is_empty() && d.wb.sheets.iter().all(|sh| sh.cells.is_empty()))
+        && s.active().is_some_and(|d| {
+            d.path.is_none() && d.wb.source_path.is_none() && !d.is_dirty() && d.undo.is_empty() && d.wb.sheets.iter().all(|sh| sh.cells.is_empty())
+        })
     {
         s.close_document(0);
     }
     // Someone else may have made the file: its active content asks before it runs.
     let mut doc = DocState::new(wb, path, title, crate::Trust::FromFile);
-    if read_only {
+    if read_only || (xlsx_only && (imported || encrypted)) {
         doc.read_only_source = str_param(p, "path").map(str::to_string);
     }
-    if crate::io::FileKind::from_path(&name).is_none() && gridcraft_xlsx::sniff(&bytes) == gridcraft_xlsx::Format::Xlsx {
+    if crate::io::FileKind::from_path(&name).is_none() && format == gridcraft_xlsx::Format::Xlsx {
         doc.content_kind = Some(crate::io::FileKind::Xlsx);
     }
     let i = s.add_document(doc);
@@ -138,12 +145,16 @@ fn save(s: &mut Session, p: &Json) -> Result<Json> {
             return ok();
         }
     };
-    if s.active().and_then(|d| d.read_only_source.as_deref()).is_some_and(|src| same_file(src, &path)) {
-        return Err(bad("file.save", "is reserved by its author and open read-only. Save As to another file."));
+    let active = s.doc()?;
+    if active.read_only_source.as_deref().is_some_and(|src| same_file(src, &path)) {
+        return Err(bad("file.save", "The source is open read-only. Save As to another file."));
+    }
+    if s.documents().iter().any(|doc| doc.uid != active.uid && doc.path.as_deref().is_some_and(|other| same_file(other, &path))) {
+        return Err(bad("file.save", "That file is already open in another workbook. Choose another name."));
     }
     // A PDF is a print of the sheet (Page Setup applies), not a copy of the workbook: the
     // document keeps its file and its unsaved changes.
-    if std::path::Path::new(&path).extension().and_then(std::ffi::OsStr::to_str).is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+    if crate::io::path_has_extension(&path, "pdf") {
         return super::print::export_pdf(s, &json!({"path": path}));
     }
     let d = s.doc_mut()?;
@@ -249,7 +260,7 @@ fn export(s: &mut Session, p: &Json, ext: &str) -> Result<Json> {
     if p.get("sheet").is_some() {
         wb.set_active_sheet(target_sheet(s, p)?);
     }
-    let target = if path.ends_with(&format!(".{ext}")) { path.clone() } else { format!("{path}.{ext}") };
+    let target = if crate::io::path_has_extension(&path, ext) { path } else { format!("{path}.{ext}") };
     let bytes = if ext == "csv" && bool_param(p, "values").unwrap_or(false) {
         crate::io::csv_values_bytes(&wb)?
     } else {

@@ -24,7 +24,8 @@ mod tools;
 mod validation;
 
 pub use filter::{
-    FilterChoice, filter_by_cell_params, filter_choices, filter_choices_params, filter_choices_selection, filter_selection, filter_values,
+    FilterChoice, filter_by_cell_params, filter_choices, filter_choices_in, filter_choices_params, filter_choices_selection,
+    filter_choices_selection_in, filter_selection, filter_values,
 };
 pub(crate) use filter::{apply_filter, grow_autofilter, migrate_loaded_autofilters, slicer_identity_token, slicer_tile_text};
 use filter::{clear_filter, filter_by, reapply, toggle_filter};
@@ -70,7 +71,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Filter Column",
             [],
             None,
-            "{column: \"B\" (or 0-based offset), values?: [..], blanks?: bool, custom?: {op: \">\", value: \"10\", op2?, value2?, and?}, top?: {count, bottom?, percent?}, aboveAverage?: bool, clear?: bool}",
+            "{column: \"B\" (or 0-based offset), table?: \"Table1\", values?: [..], blanks?: bool, custom?: {op: \">\", value: \"10\", op2?, value2?, and?}, top?: {count, bottom?, percent?}, aboveAverage?: bool, clear?: bool}",
             has_doc,
             filter_by
         ),

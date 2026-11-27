@@ -214,6 +214,8 @@ pub fn show(app: &mut SheetApp, ctx: &egui::Context) {
                 "goTo" => go_to(app, ui, &mut d, &mut confirm),
                 "zoom" => zoom(ui, &mut d, &mut confirm, &mut open),
                 "sort" => sort(app, ui, &mut d, &mut confirm),
+                "moveSheet" => super::sheets::move_sheet(app, ui, &mut d, &mut confirm, &mut open),
+                "unhideSheet" => super::sheets::unhide_sheet(app, ui, &mut d, &mut confirm, &mut open),
                 "nameManager" => name_manager(app, ui, &mut d, &mut open),
                 "pasteName" => paste_name(app, ui, &mut d, &mut confirm, &mut open),
                 "manageRules" => manage_rules(app, ui),

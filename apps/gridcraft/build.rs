@@ -51,10 +51,17 @@ fn main() {
         return;
     }
     let mut res = winresource::WindowsResource::new();
+    let (name, description, company) = if nightly {
+        ("GridCraft Nightly", "GridCraft Nightly spreadsheet", "Learning Machines LLC")
+    } else if cfg!(feature = "hucre-desktop") {
+        ("Hücre", "Hücre Spreadsheet (GridCraft)", "Hücre")
+    } else {
+        ("GridCraft", "GridCraft spreadsheet", "Learning Machines LLC")
+    };
     res.set_icon(build_channel::windows_icon_path(nightly))
-        .set("ProductName", if nightly { "GridCraft Nightly" } else { "GridCraft" })
-        .set("FileDescription", if nightly { "GridCraft Nightly spreadsheet" } else { "GridCraft spreadsheet" })
-        .set("CompanyName", "Learning Machines LLC")
+        .set("ProductName", name)
+        .set("FileDescription", description)
+        .set("CompanyName", company)
         .set("LegalCopyright", "Copyright (c) the GridCraft authors. MIT OR Apache-2.0.")
         .set("OriginalFilename", "gridcraft.exe")
         .set("InternalName", "gridcraft");

@@ -335,11 +335,13 @@ pub fn contrast(a: Color32, b: Color32) -> f32 {
 
 /// Installs light and dark token visuals in both theme slots, keeps the 2-3 px widget and 8-10 px window/menu corner radii from 0.36, and sets spacing, text styles and the active theme.
 pub fn apply(ctx: &egui::Context, dark: bool) {
+    ctx.add_plugin(font_setup::PaperTextCoverage);
     // Install both palettes before System can switch between the style slots.
     for theme in [egui::Theme::Light, egui::Theme::Dark] {
         let dark = theme == egui::Theme::Dark;
         let t = if dark { Tokens::dark() } else { Tokens::light() };
         let mut v = if dark { Visuals::dark() } else { Visuals::light() };
+        v.text_options.color_transfer_function = egui::epaint::FontColorTransferFunction::LIGHT_MODE_DEFAULT;
         v.panel_fill = t.window;
         v.window_fill = t.menu_bg;
         v.extreme_bg_color = t.input_bg;

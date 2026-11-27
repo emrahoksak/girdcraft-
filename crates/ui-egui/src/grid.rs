@@ -330,6 +330,7 @@ pub struct GridState {
     /// Pending popup edits travel with this window and are dropped when its menu or window closes.
     pub filter_checks: Option<Vec<gridcraft_engine::cmd::data::FilterChoice>>,
     pub filter_search: String,
+    pub filter_matches: Option<Vec<usize>>,
     pub filter_buttons: Vec<egui::Id>,
     pub context_menu: Option<Pos2>,
     /// The frame a right-click opened `context_menu` in: that click's own press doesn't close it.

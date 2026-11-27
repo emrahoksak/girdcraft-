@@ -13,6 +13,8 @@
 
 <h1 align="center">GridCraft</h1>
 
+**Hücre** bu deponun varsayılan masaüstü dağıtımıdır. Türkçe çalışma akışları, sağ tık menüleri, tablo filtreleri ve güvenli XLSX kaydı için yapılan değişiklikler [Hücre kullanım notlarında](docs/hucre.md) yer alır.
+
 <p align="center">
   <b>Spreadsheets and data; an open-source, high-performance modern spreadsheet application, built in pure Rust.</b>
 </p>

@@ -50,6 +50,10 @@ impl FileKind {
     }
 }
 
+pub fn path_has_extension(path: &str, ext: &str) -> bool {
+    std::path::Path::new(path).extension().and_then(std::ffi::OsStr::to_str).is_some_and(|suffix| suffix.eq_ignore_ascii_case(ext))
+}
+
 /// The error for an encrypted workbook opened without a password contains this. The interface
 /// asks for the password when it sees it; programmatic callers pass `password` instead.
 pub const PASSWORD_REQUIRED: &str = "is password-protected. Enter its password to open it.";
@@ -1072,10 +1076,8 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o644);
     }
-    let mut f = opts.open(&tmp).map_err(|e| {
-        let _ = std::fs::remove_file(&tmp);
-        EngineError::Other(format!("{path}: {e}"))
-    })?;
+    // On create failure we do not own the path: another save may have created it.
+    let mut f = opts.open(&tmp).map_err(|e| EngineError::Other(format!("{path}: {e}")))?;
     // The replacement belongs to the saving user's primary group: restore the old file's group and
     // then its mode. When the group can't be restored its access is dropped rather than handed to a
     // different group; failing to read that back is a failed save.
@@ -1083,10 +1085,14 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
     if let Some(m) = &prior_meta {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let _ = std::os::unix::fs::fchown(&f, None, Some(m.gid()));
-        let group_kept = f.metadata().map(|now| now.gid() == m.gid()).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            EngineError::Other(format!("{path}: {e}"))
-        })?;
+        let group_kept = match f.metadata() {
+            Ok(now) => now.gid() == m.gid(),
+            Err(e) => {
+                drop(f);
+                let _ = std::fs::remove_file(&tmp);
+                return Err(EngineError::Other(format!("{path}: {e}")));
+            }
+        };
         // Best effort: a file system that can't change modes keeps the owner-only one. Without the
         // group, the old owner and other bits are kept and the group, setuid and setgid bits dropped.
         let _ = f.set_permissions(std::fs::Permissions::from_mode(restored_mode(m.mode(), group_kept)));
@@ -1100,11 +1106,12 @@ pub fn write_file(path: &str, bytes: &[u8]) -> Result<()> {
     // A file system that cannot flush at all (some network mounts; on Apple targets std asks
     // for F_FULLFSYNC, which they refuse) keeps the old behaviour: skip the flush, still rename.
     let synced = |f: &std::fs::File| f.sync_all().or_else(|e| if full_sync_unsupported(&e) { Ok(()) } else { Err(e) });
-    f.write_all(bytes).and_then(|()| f.flush()).and_then(|()| synced(&f)).map_err(|e| {
+    let written = f.write_all(bytes).and_then(|()| f.flush()).and_then(|()| synced(&f));
+    drop(f);
+    written.map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         EngineError::Other(format!("{path}: {e}"))
     })?;
-    drop(f);
     std::fs::rename(&tmp, path).map_err(|e| {
         // A write or rename that fails (full disk, the workbook locked by another app) leaves
         // no temporary file beside the user's workbook.

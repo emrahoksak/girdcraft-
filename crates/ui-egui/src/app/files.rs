@@ -1,6 +1,22 @@
 use super::{Json, Notice, NoticeKind, OpenWindow, SheetApp, clean_error, json};
 
 impl SheetApp {
+    pub(super) fn xlsx_save_suggestion(&self) -> String {
+        let Some(doc) = self.session.active() else { return "Book1.xlsx".into() };
+        let title = doc.display_title();
+        let stem = std::path::Path::new(&title).file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("Book1");
+        let copy = doc
+            .read_only_source
+            .as_deref()
+            .is_some_and(|source| std::path::Path::new(source).file_stem().and_then(std::ffi::OsStr::to_str).is_some_and(|name| name == stem));
+        let file = if copy { format!("{stem} (copy).xlsx") } else { format!("{stem}.xlsx") };
+        let path = doc.path.as_deref().map(std::path::Path::new).or(doc.wb.source_path.as_deref());
+        match path.and_then(std::path::Path::parent) {
+            Some(folder) => folder.join(file).to_string_lossy().into_owned(),
+            None => file,
+        }
+    }
+
     pub fn open_path(&mut self, path: &str) {
         match self.run("file.open", json!({"path": path})) {
             Ok(r) => self.after_open(Some(path), &r),
@@ -9,7 +25,7 @@ impl SheetApp {
             Err(e) if e.contains(gridcraft_engine::io::MODIFY_PASSWORD_REQUIRED) => {
                 self.open_dialog("openPassword", json!({"path": path, "modify": true}))
             }
-            Err(e) => self.message = Some(("GridCraft".into(), clean_error(&e))),
+            Err(e) => self.message = Some((crate::channel::name().into(), clean_error(&e))),
         }
         self.after_engine();
     }
@@ -34,6 +50,9 @@ impl SheetApp {
         // The opened workbook's window shows them, however it was opened (a script may have run
         // `file.open` on the session directly).
         self.follow_active_window();
+        if r.get("alreadyOpen").and_then(Json::as_bool) == Some(true) {
+            return;
+        }
         let Some(list) = r.get("warnings").and_then(Json::as_array) else {
             self.notice = None;
             return;
@@ -50,6 +69,8 @@ impl SheetApp {
             let dropped = vba.iter().any(|m| m.contains("dropped"));
             let text = if dropped {
                 "This workbook's VBA macros could not be loaded and were dropped, so they will not be in the saved file. Keep the original file."
+            } else if crate::channel::current() == crate::channel::Channel::Hucre {
+                "This workbook contains VBA macros. Keep the original file: saving a copy as .xlsx omits its VBA macros."
             } else {
                 "This workbook contains VBA macros. GridCraft keeps them when you save as .xlsm, but does not run them."
             };
@@ -112,7 +133,10 @@ impl SheetApp {
     /// `logic` so a hidden or logic-only frame still saves; the monotonic timestamp check keeps a
     /// forced hidden UI pass from saving the same change twice.
     pub(super) fn autosave(&mut self, ctx: &egui::Context) {
-        let dirty_xlsx = self.session.active().is_some_and(|d| d.is_dirty() && d.path.as_deref().is_some_and(|p| p.ends_with(".xlsx")));
+        let dirty_xlsx = self
+            .session
+            .active()
+            .is_some_and(|d| d.is_dirty() && d.path.as_deref().is_some_and(|path| gridcraft_engine::io::path_has_extension(path, "xlsx")));
         let now = crate::monotonic_ms();
         let autosave_due =
             self.ui.autosave && self.editor.is_none() && self.text_box_editor.is_none() && now - self.grid.last_autosave > 2000.0 && dirty_xlsx;

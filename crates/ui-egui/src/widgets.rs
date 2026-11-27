@@ -9,6 +9,52 @@ use crate::i18n;
 use crate::icons::{self, Icon};
 use crate::theme::{self, Cat, Tokens};
 
+pub fn context_frame(ui: &Ui) -> egui::Frame {
+    let t = Tokens::get(ui.ctx());
+    egui::Frame::popup(ui.style()).fill(t.menu_bg).stroke(Stroke::new(1.0, t.ribbon_border)).corner_radius(8).inner_margin(5).shadow(egui::Shadow {
+        offset: [0, 4],
+        blur: 14,
+        spread: 1,
+        color: t.shadow,
+    })
+}
+
+pub fn context_item(ui: &mut Ui, icon: Icon, label: &str) -> Response {
+    context_row(ui, icon, label, false)
+}
+
+pub fn context_row(ui: &mut Ui, icon: Icon, label: &str, submenu: bool) -> Response {
+    let t = Tokens::get(ui.ctx());
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 25.0), Sense::click());
+    if response.is_pointer_button_down_on() {
+        ui.painter().rect_filled(rect, 5.0, t.pressed);
+    } else if response.hovered() || response.has_focus() {
+        ui.painter().rect_filled(rect, 5.0, t.hover);
+    }
+    let ink = if ui.is_enabled() { t.text } else { t.text_disabled };
+    let rtl = ui.style().right_to_left;
+    let leading = |dx| if rtl { rect.right() - dx } else { rect.left() + dx };
+    icons::paint(ui.painter(), Rect::from_center_size(pos2(leading(13.0), rect.center().y), vec2(15.0, 15.0)), icon, ink);
+    let align = if rtl { Align2::RIGHT_CENTER } else { Align2::LEFT_CENTER };
+    ui.painter().text(pos2(leading(27.0), rect.center().y), align, label, theme::ui_font(12.5), ink);
+    if submenu {
+        let arrow_x = if rtl { rect.left() + 11.0 } else { rect.right() - 11.0 };
+        let arrow = Rect::from_center_size(pos2(arrow_x, rect.center().y), vec2(10.0, 10.0));
+        icons::paint(ui.painter(), arrow, if rtl { Icon::Left } else { Icon::Right }, t.text_dim);
+    } else if let Some(shortcut) = tooltip_shortcut_label(label, i18n::current(ui.ctx())) {
+        let (x, align) = if rtl { (rect.left() + 8.0, Align2::LEFT_CENTER) } else { (rect.right() - 8.0, Align2::RIGHT_CENTER) };
+        ui.painter().text(pos2(x, rect.center().y), align, shortcut, theme::ui_font(11.0), t.text_dim);
+    }
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), label));
+    response
+}
+
+fn tooltip_shortcut_label(label: &str, lang: i18n::Language) -> Option<&'static str> {
+    TOOLTIP_SHORTCUTS.iter().take(6).find_map(|(name, mac, other)| {
+        (lang.tr(name) == label && matches!(*name, "Paste" | "Cut" | "Copy")).then_some(if cfg!(target_os = "macos") { *mac } else { *other })
+    })
+}
+
 /// Translates a label or tooltip for the language of the frame being drawn (English if untranslated).
 /// Ribbon chrome all flows through these widgets, so translating here localises it in one place.
 fn tr<'a>(ui: &Ui, text: &'a str) -> &'a str {

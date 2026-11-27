@@ -1,236 +1,384 @@
 use super::editor::popup_dismissed;
 use super::geo::Geo;
-use super::tables::filter_table_range;
-use super::{Arc, Drag, FillTag, RangeRef, Rect, Sense, Sheet, SheetApp, Stroke, Tokens, col_to_letters, json, pos2, vec2};
+use super::{Drag, FillTag, RangeRef, Rect, Sense, Sheet, SheetApp, Stroke, Tokens, col_to_letters, json, pos2, vec2};
 
-/// Draws the filter-header popup: sort, search/select-all, apply/clear, a lazily installed table autofilter, new-open search focus and dismissal.
+/// Opens a read-only checklist for the clicked header. Criteria change only on Apply or Clear.
 pub(super) fn filter_menu(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, was_open: bool) {
     let Some((col, row, at)) = app.grid.filter_menu else { return };
     let Some(d) = app.session.active() else { return };
     let wb = d.wb.clone();
     let si = wb.active_sheet();
     let Some(sh) = wb.sheet(si) else { return };
+    let at_cell = gridcraft_engine::core::CellRef::new(row, col);
+    let table = sh.table_at(at_cell).filter(|t| t.header_row && t.range.start.row == row);
+    let name = table.map(|t| t.name.as_str());
+    let sort_range = table
+        .map(|t| t.data_range().map_or(t.range, |body| RangeRef::new(t.range.start, body.end)))
+        .or_else(|| sh.autofilter.as_ref().map(|af| af.range));
+    let Some(sort_range) = sort_range else {
+        app.grid.filter_menu = None;
+        return;
+    };
     let _ = geo;
-    // Tables get an autofilter on demand.
-    let table_range = filter_table_range(sh, col, row);
-    if sh.autofilter.is_none()
-        && let Some(r) = table_range
-    {
-        let _ = app.session.run("data.filter", json!({"range": r.a1()}));
-        let _ = app.session.run("data.filter", json!({"range": r.a1()}));
-        if let Some(sh2) = app.session.active().and_then(|d| d.wb.active()).map(|s| s.autofilter.is_some())
-            && !sh2
-        {
-            let d = app.session.active_mut();
-            if let Some(d) = d {
-                let wbm = Arc::make_mut(&mut d.wb);
-                if let Some(s) = wbm.sheet_mut(si) {
-                    s.autofilter = Some(gridcraft_engine::model::AutoFilter { range: r, criteria: vec![] });
-                }
-            }
+    let field_id = egui::Id::unique(("filter_menu", row, col));
+    let lang = crate::i18n::current(ui.ctx());
+    let column = col_to_letters(col);
+    let params = |mut p: serde_json::Value| {
+        if let Some(name) = name {
+            p["table"] = json!(name);
         }
-    }
-    let wb = app.session.active().map(|d| d.wb.clone()).unwrap_or(wb);
-    // Enter is the menu's OK, as in Excel: taken before the search box (which would only drop its
-    // focus) and the value checkboxes (which would toggle) see it. A focused button keeps it as its click.
+        p
+    };
+    // Enter applies from the search or a checkbox; a focused action button handles its own Enter.
     let on_button = ui.ctx().memory(|m| m.focused()).is_some_and(|f| app.grid.filter_buttons.contains(&f));
     let enter = !on_button && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
     let mut close = false;
-    let area = egui::Area::new(egui::Id::unique("filter_menu")).fixed_pos(at + vec2(-180.0, 10.0)).order(egui::Order::Foreground);
+    if !was_open {
+        app.grid.filter_search.clear();
+        app.grid.filter_matches = None;
+    }
+    let mut filter_matches = app.grid.filter_matches.take();
+    let mut checks =
+        app.grid.filter_checks.take().filter(|_| was_open).unwrap_or_else(|| gridcraft_engine::cmd::data::filter_choices_in(&wb, si, col, name));
+    let area = egui::Area::new(field_id).fixed_pos(at + vec2(-180.0, 10.0)).order(egui::Order::Foreground);
     let response = area.show(ui.ctx(), |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.set_width(230.0);
-            let ascending = ui.button("↑  Sort Ascending");
-            if ascending.clicked() {
-                let _ = app.run("data.sortAscending", json!({"column": col_to_letters(col)}));
-                close = true;
-            }
-            let descending = ui.button("↓  Sort Descending");
-            if descending.clicked() {
-                let _ = app.run("data.sortDescending", json!({"column": col_to_letters(col)}));
-                close = true;
+        crate::widgets::context_frame(ui).show(ui, |ui| {
+            use crate::icons::Icon;
+            use crate::widgets::context_item;
+            ui.set_width(244.0);
+            ui.spacing_mut().item_spacing.y = 1.0;
+            let ascending = context_item(ui, Icon::SortAsc, lang.tr("Sort A to Z"));
+            let descending = context_item(ui, Icon::SortDesc, lang.tr("Sort Z to A"));
+            for (response, cmd) in [(&ascending, "data.sortAscending"), (&descending, "data.sortDescending")] {
+                if response.clicked() {
+                    app.run_or_alert(cmd, json!({"column": column, "range": sort_range.a1(), "header": true}));
+                    close = true;
+                }
             }
             ui.separator();
-            ui.label(egui::RichText::new("Filter").strong());
-            let mut checks = app.grid.filter_checks.clone().unwrap_or_else(|| gridcraft_engine::cmd::data::filter_choices(&wb, si, col));
-            // A search narrows the list; Select All and Apply then only cover the matches.
-            let mut search = app.grid.filter_search.clone();
-            let field = ui.add(egui::TextEdit::singleline(&mut search).hint_text("Search").desired_width(f32::INFINITY));
+            ui.label(egui::RichText::new(lang.tr("Filter")).strong());
+            let field = ui.add(egui::TextEdit::singleline(&mut app.grid.filter_search).hint_text(lang.tr("Search")).desired_width(f32::INFINITY));
             if !was_open {
                 field.request_focus();
             }
-            let needle = search.trim().to_lowercase();
-            let matches = |v: &str| needle.is_empty() || v.to_lowercase().contains(&needle);
-            let all = checks.iter().filter(|c| matches(&c.label)).all(|c| c.checked);
-            let mut all_new = all;
-            let label = if needle.is_empty() { "(Select All)" } else { "(Select All Search Results)" };
-            if ui.checkbox(&mut all_new, label).changed() {
-                for c in checks.iter_mut().filter(|c| matches(&c.label)) {
-                    c.checked = all_new;
-                }
+            if field.changed() {
+                let needle = app.grid.filter_search.trim().to_lowercase();
+                filter_matches = (!needle.is_empty()).then(|| {
+                    checks
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, c)| filter_choice_label(lang, c.value.is_none(), &c.label).to_lowercase().contains(&needle).then_some(i))
+                        .collect()
+                });
             }
-            // Full width: shrunk to the longest value, the scroll bar sat mid-menu and the wheel only
-            // worked over the values themselves (#432).
-            egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]).show(ui, |ui| {
-                for c in checks.iter_mut().filter(|c| matches(&c.label)) {
-                    ui.checkbox(&mut c.checked, c.label.as_str());
+            let matching = filter_matches.as_deref();
+            let count = matching.map_or(checks.len(), <[usize]>::len);
+            let index = |i| matching.map_or(i, |entries| entries[i]);
+            let checked = (0..count).filter(|&i| checks[index(i)].checked).count();
+            let mut all = checked == count;
+            let label = if matching.is_none() { "(Select All)" } else { "(Select All Search Results)" };
+            let mut any = checked > 0;
+            if ui.checkbox(&mut all, lang.tr(label)).changed() {
+                for i in 0..count {
+                    checks[index(i)].checked = all;
+                }
+                any = all && count > 0;
+            }
+            let row_height = 22.0;
+            let mut changed = false;
+            let mut list = egui::ScrollArea::vertical().max_height(220.0).auto_shrink([false, true]);
+            if field.changed() {
+                list = list.vertical_scroll_offset(0.0);
+            }
+            list.show_rows(ui, row_height, count, |ui, visible| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                let size = vec2(ui.available_width(), row_height);
+                for i in visible {
+                    let c = &mut checks[index(i)];
+                    let label = filter_choice_label(lang, c.value.is_none(), &c.label);
+                    changed |= ui.add_sized(size, egui::Checkbox::new(&mut c.checked, label)).changed();
                 }
             });
-            app.grid.filter_checks = Some(checks.clone());
-            app.grid.filter_search.clone_from(&search);
-            let visible_checks: Vec<gridcraft_engine::cmd::data::FilterChoice> = checks
-                .iter()
-                .cloned()
-                .map(|mut c| {
-                    c.checked &= matches(&c.label);
-                    c
-                })
-                .collect();
+            if changed {
+                any = (0..count).any(|i| checks[index(i)].checked);
+            }
             ui.separator();
             ui.horizontal(|ui| {
-                let clear = ui.button("Clear Filter");
+                let clear = ui.button(lang.tr("Clear Filter"));
                 if clear.clicked() {
-                    let _ = app.run("data.filterBy", json!({"column": col_to_letters(col), "clear": true}));
+                    app.run_or_alert("data.filterBy", params(json!({"column": column, "clear": true})));
                     close = true;
                 }
-                // Nothing checked would hide every row, so Enter (unlike a click on Apply) does nothing then.
-                let any = visible_checks.iter().any(|c| c.checked);
-                let apply = ui.button("Apply");
+                let apply = ui.add_enabled(any, egui::Button::new(lang.tr("Apply")));
                 app.grid.filter_buttons = vec![ascending.id, descending.id, clear.id, apply.id];
                 if apply.clicked() || (enter && any) {
-                    let mut merged = gridcraft_engine::cmd::data::filter_choices_selection(&wb, si, col, &visible_checks);
-                    for c in &mut merged {
-                        c.checked &= matches(&c.label);
+                    // Preserve choices excluded by another column, but apply only the current
+                    // search matches amongst the remaining choices.
+                    if let Some(matching) = matching {
+                        let mut matches = matching.iter().copied().peekable();
+                        for (i, c) in checks.iter_mut().enumerate() {
+                            c.checked &= matches.next_if_eq(&i).is_some();
+                        }
                     }
-                    let active_checks: Vec<_> = merged.iter().map(|c| (c, c.checked)).collect();
-                    let p = gridcraft_engine::cmd::data::filter_choices_params(&col_to_letters(col), &active_checks);
-                    let _ = app.run("data.filterBy", p);
+                    let selection = gridcraft_engine::cmd::data::filter_choices_selection_in(&wb, si, col, name, &checks);
+                    let selected: Vec<_> = selection.iter().map(|c| (c, c.checked)).collect();
+                    let p = gridcraft_engine::cmd::data::filter_choices_params(&column, &selected);
+                    app.run_or_alert("data.filterBy", params(p));
                     close = true;
                 }
             });
         });
     });
     if close || popup_dismissed(&response.response, was_open) {
-        app.grid.filter_checks = None;
         app.grid.filter_search.clear();
+        app.grid.filter_matches = None;
         app.grid.filter_buttons.clear();
         app.grid.filter_menu = None;
+    } else {
+        app.grid.filter_checks = Some(checks);
+        app.grid.filter_matches = filter_matches;
     }
 }
 
-/// Draws and dispatches the cell context menu, including Show Details when offered, clipboard and insert/format actions; closes on Esc or an outside press.
+fn filter_choice_label(lang: crate::i18n::Language, blank: bool, label: &str) -> &str {
+    if blank { lang.tr("(Blanks)") } else { label }
+}
+
+/// Shows the cell actions at the pointer or at the keyboard-selected cell.
 pub(super) fn context_menu(app: &mut SheetApp, ui: &mut egui::Ui) {
     let Some(at) = app.grid.context_menu else { return };
-    let mut close = false;
-    let resp = egui::Area::new(egui::Id::unique("cell_context")).fixed_pos(at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.set_min_width(200.0);
-            let insert_copied = insert_copied_item(app);
-            // On a cell with a link Excel offers to edit, open or remove it (#2120).
-            let link =
-                app.session.active().and_then(|d| d.wb.active().and_then(|sh| sh.hyperlinks.get(&d.selection.active)).map(|l| l.target.clone()));
-            let mut items: Vec<(&str, &str)> = vec![
-                ("Cut", "edit.cut"),
-                ("Copy", "edit.copy"),
-                ("Paste", "edit.paste"),
-                ("Paste Special…", "ui:pasteSpecial"),
-                ("-", ""),
-                ("Insert…", "ui:insertCells"),
-                ("Delete…", "ui:deleteCells"),
-                ("Clear Contents", "edit.clearContents"),
-                ("-", ""),
-                ("Filter by Selected Cell's Value", "ui:filterValue"),
-                ("Sort A to Z", "data.sortAscending"),
-                ("Sort Z to A", "data.sortDescending"),
-                ("-", ""),
-                ("New Comment", "ui:newComment"),
-                ("New Note", "ui:newNote"),
-                ("-", ""),
-                ("Format Cells…", "ui:formatCells"),
-                ("Pick From Drop-down List…", "ui:pickList"),
-                ("Define Name…", "ui:defineName"),
-                ("Link…", "ui:insertLink"),
-            ];
-            if let Some(item) = insert_copied {
-                items.insert(6, item);
-            }
-            if link.is_some()
-                && let Some(i) = items.iter().position(|(_, id)| *id == "ui:insertLink")
-            {
-                items.splice(
-                    i..=i,
-                    [("Edit Hyperlink…", "ui:insertLink"), ("Open Hyperlink", "ui:openLink"), ("Remove Hyperlink", "edit.clearHyperlinks")],
-                );
-            }
-            if show_details_offered(app)
-                && let Some(i) = items.iter().position(|(_, id)| *id == "data.sortDescending")
-            {
-                items.insert(i + 1, ("-", ""));
-                items.insert(i + 2, ("Show Details", "pivot.showDetails"));
-            }
-            let lang = crate::i18n::current(ui.ctx());
-            for (label, id) in items {
-                if label == "-" {
-                    ui.separator();
-                    continue;
-                }
-                if ui.add(egui::Button::new(lang.tr(label)).frame_when_inactive(false).min_size(vec2(190.0, 20.0))).clicked() {
-                    close = true;
-                    match id {
-                        "ui:pasteSpecial" => app.open_dialog("pasteSpecial", json!({})),
-                        "ui:insertPaste" => app.open_dialog("insertPaste", json!({})),
-                        "ui:insertCells" => app.open_dialog("insertCells", json!({})),
-                        "ui:deleteCells" => app.open_dialog("deleteCells", json!({})),
-                        "ui:formatCells" => app.open_dialog("formatCells", json!({})),
-                        "ui:newComment" => app.open_dialog("comment", json!({"threaded": true})),
-                        "ui:newNote" => app.open_dialog("comment", json!({"threaded": false})),
-                        "ui:defineName" => app.open_dialog("defineName", json!({})),
-                        "ui:insertLink" => app.open_dialog("insertLink", json!({})),
-                        "ui:openLink" => {
-                            if let Some(target) = &link {
-                                super::interact::follow_link(app, target);
-                            }
-                        }
-                        "ui:pickList" => app.open_dialog("pickList", json!({})),
-                        "ui:filterValue" => {
-                            if let Some(d) = app.session.active() {
-                                let a = d.selection.active;
-                                let col = col_to_letters(a.col);
-                                let params =
-                                    d.wb.active()
-                                        .map(|sh| gridcraft_engine::cmd::data::filter_by_cell_params(&d.wb, sh, a, &col))
-                                        .unwrap_or_else(|| json!({"column": col, "values": [], "blanks": true}));
-                                let has = d.wb.active().is_some_and(|sh| sh.autofilter.is_some());
-                                if !has {
-                                    let _ = app.run("data.filter", json!({}));
-                                }
-                                app.run_or_alert("data.filterBy", params);
-                            }
-                        }
-                        "edit.copy" | "edit.cut" => {
-                            app.copy_to_clipboard(ui.ctx(), id);
-                        }
-                        "edit.paste" => app.paste_from_clipboard(),
-                        other => app.run_or_alert(other, json!({})),
-                    }
-                }
-            }
+    let mut open = true;
+    let lang = crate::i18n::current(ui.ctx());
+    let tokens = Tokens::get(ui.ctx());
+    let style = move |style: &mut egui::Style| {
+        style.spacing.item_spacing.y = 1.0;
+        style.visuals.window_fill = tokens.menu_bg;
+        style.visuals.window_stroke = Stroke::new(1.0, tokens.ribbon_border);
+        style.visuals.window_corner_radius = 8.into();
+        style.visuals.popup_shadow = egui::Shadow { offset: [0, 4], blur: 14, spread: 1, color: tokens.shadow };
+    };
+    let id = egui::Id::unique(("cell_context", app.grid.context_menu_frame));
+    egui::Popup::new(id, ui.ctx().clone(), at, ui.layer_id())
+        .kind(egui::PopupKind::Menu)
+        .open_bool(&mut open)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .layout(egui::Layout::top_down_justified(egui::Align::Min))
+        .style(style)
+        .frame(crate::widgets::context_frame(ui))
+        .accessible_name(lang.tr("Cell Context Menu"))
+        .max_height_from_constrain(true)
+        .show(|ui| {
+            let height = ui.available_height();
+            egui::ScrollArea::vertical().max_height(height).show(ui, |ui| {
+                ui.set_width(244.0);
+                cell_menu_items(app, ui);
+            });
         });
-    });
-    // A quick right-click presses and releases in one frame, and the menu's corner snaps to the
-    // nearest physical pixel, which can put the pointer just outside it: that press opened the
-    // menu, so it doesn't count as a click elsewhere.
-    let opened_now = app.grid.context_menu_frame == ui.ctx().cumulative_frame_nr();
-    if close
-        || crate::framework::escape_pressed(ui.ctx())
-        || (!opened_now
-            && ui.input(|i| i.pointer.any_pressed())
-            && !resp.response.contains_pointer()
-            && !resp.response.hovered()
-            && ui.input(|i| i.pointer.interact_pos()).is_some_and(|p| !resp.response.rect.contains(p)))
-    {
+    if !open {
         app.grid.context_menu = None;
     }
+}
+
+fn cell_menu_items(app: &mut SheetApp, ui: &mut egui::Ui) {
+    use crate::icons::Icon;
+    let link = app.session.active().and_then(|d| d.wb.active().and_then(|sh| sh.hyperlinks.get(&d.selection.active)).map(|l| l.target.clone()));
+    let has_filter = app.session.active().is_some_and(|d| {
+        d.wb.active()
+            .is_some_and(|sh| sh.autofilter.as_ref().is_some_and(|af| !af.criteria.is_empty()) || sh.tables.iter().any(|t| !t.filter.is_empty()))
+    });
+    if context_choice(ui, Icon::Pen, "Edit Cell") {
+        app.begin_edit(None, false);
+    }
+    ui.separator();
+    for (icon, label, cmd) in [
+        (Icon::Cut, "Cut", "edit.cut"),
+        (Icon::Copy, "Copy", "edit.copy"),
+        (Icon::Paste, "Paste", "edit.paste"),
+        (Icon::Format, "Paste Special…", "ui:pasteSpecial"),
+    ] {
+        if context_choice(ui, icon, label) {
+            run_cell_action(app, ui, cmd);
+        }
+    }
+    ui.separator();
+    cell_submenu(ui, Icon::Insert, "Insert", |ui| {
+        cell_shift_options(app, ui, true);
+        ui.separator();
+        if context_choice(ui, Icon::Settings, "More Insert Options…") {
+            run_cell_action(app, ui, "ui:insertCells");
+        }
+        if let Some((label, cmd)) = insert_copied_item(app)
+            && context_choice(ui, Icon::Copy, label)
+        {
+            run_cell_action(app, ui, cmd);
+        }
+    });
+    cell_submenu(ui, Icon::Delete, "Delete", |ui| {
+        cell_shift_options(app, ui, false);
+        ui.separator();
+        if context_choice(ui, Icon::Settings, "More Delete Options…") {
+            run_cell_action(app, ui, "ui:deleteCells");
+        }
+    });
+    cell_submenu(ui, Icon::Eraser, "Clear", |ui| {
+        for (icon, label, cmd) in [
+            (Icon::Eraser, "Clear Contents", "edit.clearContents"),
+            (Icon::Brush, "Clear Formats", "edit.clearFormats"),
+            (Icon::Comment, "Clear Comments and Notes", "edit.clearComments"),
+            (Icon::Link, "Clear Hyperlinks", "edit.clearHyperlinks"),
+            (Icon::Delete, "Clear All", "edit.clearAll"),
+        ] {
+            if context_choice(ui, icon, label) {
+                run_cell_action(app, ui, cmd);
+            }
+        }
+    });
+    ui.separator();
+    cell_submenu(ui, Icon::SortFilter, "Sort", |ui| {
+        for (icon, label, cmd) in [(Icon::SortAsc, "Sort A to Z", "data.sortAscending"), (Icon::SortDesc, "Sort Z to A", "data.sortDescending")] {
+            if context_choice(ui, icon, label) {
+                run_cell_action(app, ui, cmd);
+            }
+        }
+        if context_choice(ui, Icon::SortFilter, "Custom Sort…") {
+            run_cell_action(app, ui, "ui:sort");
+        }
+    });
+    cell_submenu(ui, Icon::Filter, "Filter", |ui| {
+        if context_choice(ui, Icon::Filter, "Filter by Selected Cell's Value") {
+            filter_by_selected_cell(app);
+        }
+    });
+    ui.add_enabled_ui(has_filter, |ui| {
+        if context_choice(ui, Icon::Redo, "Reapply") {
+            run_cell_action(app, ui, "data.reapply");
+        }
+    });
+    if show_details_offered(app) && context_choice(ui, Icon::PivotTable, "Show Details") {
+        run_cell_action(app, ui, "pivot.showDetails");
+    }
+    ui.separator();
+    for (icon, label, cmd) in [(Icon::Comment, "New Comment", "ui:newComment"), (Icon::Note, "New Note", "ui:newNote")] {
+        if context_choice(ui, icon, label) {
+            run_cell_action(app, ui, cmd);
+        }
+    }
+    ui.separator();
+    if context_choice(ui, Icon::Format, "Format Cells…") {
+        run_cell_action(app, ui, "ui:formatCells");
+    }
+    cell_submenu(ui, Icon::Comma, "Number Format", |ui| {
+        for (icon, format) in [
+            (Icon::Format, "General"),
+            (Icon::Comma, "Number"),
+            (Icon::Currency, "Currency"),
+            (Icon::Percent, "Percentage"),
+            (Icon::Calendar, "Short Date"),
+            (Icon::TextBox, "Text"),
+        ] {
+            if context_choice(ui, icon, format) {
+                app.run_or_alert("home.numberFormat", json!({"format": format}));
+            }
+        }
+    });
+    for (icon, label, cmd) in [
+        (Icon::CondFormat, "Conditional Formatting", "ui:newFormattingRule"),
+        (Icon::Validation, "Pick From Drop-down List…", "ui:pickList"),
+        (Icon::Name, "Define Name…", "ui:defineName"),
+    ] {
+        if context_choice(ui, icon, label) {
+            run_cell_action(app, ui, cmd);
+        }
+    }
+    ui.separator();
+    if context_choice(ui, Icon::Fx, "Insert Function") {
+        run_cell_action(app, ui, "ui:insertFunction");
+    }
+    if let Some(target) = link {
+        if context_choice(ui, Icon::Link, "Edit Hyperlink…") {
+            run_cell_action(app, ui, "ui:insertLink");
+        }
+        if context_choice(ui, Icon::OpenFolder, "Open Hyperlink") {
+            super::interact::follow_link(app, &target);
+        }
+        if context_choice(ui, Icon::Eraser, "Remove Hyperlink") {
+            run_cell_action(app, ui, "edit.clearHyperlinks");
+        }
+    } else if context_choice(ui, Icon::Link, "Link…") {
+        run_cell_action(app, ui, "ui:insertLink");
+    }
+    ui.separator();
+    cell_submenu(ui, Icon::Freeze, "Freeze Panes", |ui| {
+        for (label, cmd) in [
+            ("Freeze Panes", "view.freezePanes"),
+            ("Freeze Top Row", "view.freezeTopRow"),
+            ("Freeze First Column", "view.freezeFirstColumn"),
+            ("Unfreeze Panes", "view.unfreezePanes"),
+        ] {
+            if context_choice(ui, Icon::Freeze, label) {
+                run_cell_action(app, ui, cmd);
+            }
+        }
+    });
+}
+
+fn cell_shift_options(app: &mut SheetApp, ui: &mut egui::Ui, insert: bool) {
+    use crate::icons::Icon;
+    let (command, horizontal, vertical) = if insert {
+        ("home.insertCells", (Icon::Right, "Shift cells right", "right"), (Icon::Chevron, "Shift cells down", "down"))
+    } else {
+        ("home.deleteCells", (Icon::Left, "Shift cells left", "left"), (Icon::ChevronUp, "Shift cells up", "up"))
+    };
+    for (icon, label, shift) in [horizontal, vertical, (Icon::Table, "Entire row", "row"), (Icon::Borders, "Entire column", "column")] {
+        if context_choice(ui, icon, label) {
+            app.run_or_alert(command, json!({"shift": shift}));
+        }
+    }
+}
+
+fn cell_submenu(ui: &mut egui::Ui, icon: crate::icons::Icon, label: &str, contents: impl FnOnce(&mut egui::Ui)) {
+    let label = crate::i18n::current(ui.ctx()).tr(label);
+    let response = crate::widgets::context_row(ui, icon, label, true);
+    egui::containers::menu::SubMenu::new().show(ui, &response, |ui| {
+        ui.set_width(244.0);
+        contents(ui);
+    });
+}
+
+fn context_choice(ui: &mut egui::Ui, icon: crate::icons::Icon, label: &str) -> bool {
+    let label = crate::i18n::current(ui.ctx()).tr(label);
+    if crate::widgets::context_item(ui, icon, label).clicked() {
+        ui.close();
+        return true;
+    }
+    false
+}
+
+fn run_cell_action(app: &mut SheetApp, ui: &egui::Ui, command: &str) {
+    match command {
+        "edit.copy" | "edit.cut" => app.copy_to_clipboard(ui.ctx(), command),
+        "edit.paste" => app.paste_from_clipboard(),
+        "ui:newComment" => app.open_dialog("comment", json!({"threaded": true})),
+        "ui:newNote" => app.open_dialog("comment", json!({"threaded": false})),
+        _ => {
+            if let Some(dialog) = command.strip_prefix("ui:") {
+                app.open_dialog(dialog, json!({}));
+            } else {
+                app.run_or_alert(command, json!({}));
+            }
+        }
+    }
+}
+
+fn filter_by_selected_cell(app: &mut SheetApp) {
+    let Some(d) = app.session.active() else { return };
+    let Some(sh) = d.wb.active() else { return };
+    let cell = d.selection.active;
+    let mut params = gridcraft_engine::cmd::data::filter_by_cell_params(&d.wb, sh, cell, &col_to_letters(cell.col));
+    if let Some(table) = sh.table_at(cell).filter(|t| t.header_row) {
+        params["table"] = json!(table.name);
+    }
+    app.run_or_alert("data.filterBy", params);
 }
 
 /// Whether the cell menu offers Show Details (Excel's right-click › Show Details): the active cell
@@ -506,58 +654,65 @@ pub(super) fn error_check_tag(app: &mut SheetApp, ui: &mut egui::Ui, geo: &Geo, 
 
 /// Draws row/column header context menus with insert/delete, format, size, hide/unhide and group actions, plus Insert Copied Cells when available.
 pub(super) fn header_menu(app: &mut SheetApp, ui: &mut egui::Ui, was_open: bool) {
+    use crate::icons::Icon;
+    use crate::widgets::{context_frame, context_item};
+
     let Some((at, rows)) = app.grid.header_menu else { return };
     let mut close = false;
     let response = egui::Area::new(egui::Id::unique("header_menu")).fixed_pos(at).order(egui::Order::Foreground).show(ui.ctx(), |ui| {
-        egui::Frame::popup(ui.style()).show(ui, |ui| {
-            ui.set_min_width(190.0);
-            let insert_copied = insert_copied_item(app);
-            let mut items: Vec<(&str, &str)> = if rows {
-                vec![
-                    ("Cut", "edit.cut"),
-                    ("Copy", "edit.copy"),
-                    ("Paste", "edit.paste"),
-                    ("-", ""),
-                    ("Header Menu|Insert", "home.insertRows"),
-                    ("Delete", "home.deleteRows"),
-                    ("Clear Contents", "edit.clearContents"),
-                    ("-", ""),
-                    ("Format Cells…", "ui:formatCells"),
+        context_frame(ui).show(ui, |ui| {
+            let (insert, delete, dimension, fit, hide, unhide) = if rows {
+                (
+                    "home.insertRows",
+                    "home.deleteRows",
                     ("Row Height…", "ui:rowHeight"),
                     ("AutoFit Row Height", "home.autofitRowHeight"),
-                    ("Hide", "home.hideRows"),
-                    ("Unhide", "home.unhideRows"),
-                    ("Group", "data.group"),
-                ]
+                    "home.hideRows",
+                    "home.unhideRows",
+                )
             } else {
-                vec![
-                    ("Cut", "edit.cut"),
-                    ("Copy", "edit.copy"),
-                    ("Paste", "edit.paste"),
-                    ("-", ""),
-                    ("Header Menu|Insert", "home.insertColumns"),
-                    ("Delete", "home.deleteColumns"),
-                    ("Clear Contents", "edit.clearContents"),
-                    ("-", ""),
-                    ("Format Cells…", "ui:formatCells"),
+                (
+                    "home.insertColumns",
+                    "home.deleteColumns",
                     ("Column Width…", "ui:columnWidth"),
                     ("AutoFit Column Width", "home.autofitColumnWidth"),
-                    ("Hide", "home.hideColumns"),
-                    ("Unhide", "home.unhideColumns"),
-                    ("Sort A to Z", "data.sortAscending"),
-                    ("Group", "data.group"),
-                ]
+                    "home.hideColumns",
+                    "home.unhideColumns",
+                )
             };
-            if let Some(item) = insert_copied {
-                items.insert(5, item);
-            }
+            ui.set_width(220.0);
+            ui.spacing_mut().item_spacing.y = 1.0;
+            let clipboard = [(Icon::Cut, "Cut", "edit.cut"), (Icon::Copy, "Copy", "edit.copy"), (Icon::Paste, "Paste", "edit.paste")];
+            let insertion =
+                [(Icon::Insert, "Header Menu|Insert", insert)].into_iter().chain(insert_copied_item(app).map(|(label, id)| (Icon::Paste, label, id)));
+            let structure = [(Icon::Delete, "Delete", delete), (Icon::Eraser, "Clear Contents", "edit.clearContents")];
+            let layout = [
+                (Icon::Format, "Format Cells…", "ui:formatCells"),
+                (Icon::Expand, dimension.0, dimension.1),
+                (Icon::Relative, fit.0, fit.1),
+                (Icon::Collapse, "Hide", hide),
+                (Icon::Expand, "Unhide", unhide),
+            ];
+            let sort = (!rows).then_some((Icon::SortAsc, "Sort A to Z", "data.sortAscending"));
+            // Separators share the same row stream as the actions so shortcut and dialog routing
+            // stay in one place.
+            let items = clipboard
+                .into_iter()
+                .map(Some)
+                .chain([None])
+                .chain(insertion.map(Some))
+                .chain(structure.into_iter().map(Some))
+                .chain([None])
+                .chain(layout.into_iter().map(Some))
+                .chain(sort.map(Some))
+                .chain([Some((Icon::Group, "Group", "data.group"))]);
             let lang = crate::i18n::current(ui.ctx());
-            for (label, id) in items {
-                if label == "-" {
+            for item in items {
+                let Some((icon, label, id)) = item else {
                     ui.separator();
                     continue;
-                }
-                if ui.add(egui::Button::new(lang.tr(label)).frame_when_inactive(false).min_size(vec2(180.0, 20.0))).clicked() {
+                };
+                if context_item(ui, icon, lang.tr(label)).clicked() {
                     close = true;
                     match id {
                         "ui:insertPaste" => app.open_dialog("insertPaste", json!({})),

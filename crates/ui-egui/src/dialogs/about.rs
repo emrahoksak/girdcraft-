@@ -21,6 +21,18 @@ pub(super) fn about(ui: &mut egui::Ui, d: &mut Dialog) {
                 ui.label(egui::RichText::new(format!("Built from {commit}")).small());
             }
             ui.add_space(4.0);
+            if crate::channel::current() == crate::channel::Channel::Hucre {
+                ui.label("GridCraft 0.19.1 · ArtCraft Team and the GridCraft contributors");
+                ui.hyperlink_to("GridCraft kaynak kodu", "https://github.com/storytold/gridcraft/tree/296a4bf9a64a738c255877b546548a8594264092");
+                ui.collapsing("Lisanslar", |ui| {
+                    egui::ScrollArea::vertical().max_height(210.0).show(ui, |ui| {
+                        ui.label(include_str!("../../../../LICENSE-MIT"));
+                        ui.separator();
+                        ui.label(include_str!("../../../../NOTICE"));
+                    });
+                });
+                return;
+            }
             ui.label("A clean-room, open-source, Rust-native spreadsheet. Part of ArtCraft.");
             ui.hyperlink_to("getartcraft.com/apps/gridcraft", "https://getartcraft.com/apps/gridcraft");
             ui.hyperlink_to("Join the ArtCraft Discord", "https://discord.gg/artcraft");

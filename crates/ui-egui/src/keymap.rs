@@ -33,7 +33,7 @@ pub enum Shortcut {
     ScreenLeft,
     /// Excel for Mac Control+U: edit the active cell (like F2).
     Edit,
-    /// Shift+F10: the cell context menu.
+    /// Shift+F10 or Menu: the context menu for the current selection.
     ContextMenu,
     /// Alt+Down: the active cell's drop-down list.
     DropDown,
@@ -325,6 +325,7 @@ fn lookup_function_shortcuts(ctx: LookupContext) -> Option<Shortcut> {
         F7 if plain && !s => Shortcut::Dialog("spelling", json!({})),
         F9 if plain && s => run("formulas.calculateSheet"),
         F10 if plain && s => Shortcut::ContextMenu,
+        Menu if plain && !s => Shortcut::ContextMenu,
         F11 if plain && s => run("home.insertSheet"),
         F12 if plain && !s => run("file.saveAs"),
         _ => return None,
@@ -394,7 +395,7 @@ pub(crate) fn dispatch(app: &mut SheetApp, ctx: &egui::Context, key: Key, physic
         Shortcut::Edit => app.begin_edit(None, false),
         Shortcut::PythonMode => app.toggle_python_mode(),
         Shortcut::QuickAnalysis => crate::ribbon::quick_analysis(app),
-        Shortcut::ContextMenu => app.grid.context_menu = Some(geo.cell_rect(sh, active).center()),
+        Shortcut::ContextMenu => open_selection_context(app, ctx, geo, sh, active),
         Shortcut::DropDown => {
             if sh.validations.iter().any(|d| d.in_cell_dropdown && d.ranges.iter().any(|r| r.contains(active))) {
                 app.grid.list_picker = Some(active);
@@ -409,6 +410,28 @@ pub(crate) fn dispatch(app: &mut SheetApp, ctx: &egui::Context, key: Key, physic
         }
     }
     true
+}
+
+fn open_selection_context(app: &mut SheetApp, ctx: &egui::Context, geo: &Geo, sh: &Sheet, active: CellRef) {
+    let cell = sh.merge_at(active).map_or_else(|| geo.cell_rect(sh, active), |range| geo.range_rect(sh, range));
+    let mut at = geo.cells.clamp(cell.center());
+    let header = app.session.active().and_then(|doc| {
+        let selection = doc.selection.current();
+        let rows = selection.is_full_rows();
+        let columns = selection.is_full_cols();
+        (sh.show_headings && rows != columns).then_some(rows)
+    });
+    if let Some(rows) = header {
+        if rows {
+            at.x = (geo.head_left() + geo.cells.left()) * 0.5;
+        } else {
+            at.y = (geo.head_top() + geo.cells.top()) * 0.5;
+        }
+        app.grid.header_menu = Some((geo.mirror_pos(at), rows));
+    } else {
+        app.grid.context_menu = Some(geo.mirror_pos(at));
+        app.grid.context_menu_frame = ctx.cumulative_frame_nr();
+    }
 }
 
 /// Starts editing the active cell with `text` and the caret at its end.

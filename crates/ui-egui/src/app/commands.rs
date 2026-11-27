@@ -16,7 +16,20 @@ impl SheetApp {
         r
     }
 
-    pub(super) fn run_command(&mut self, id: &str, params: Json) -> Result<Json, String> {
+    pub(super) fn run_command(&mut self, id: &str, mut params: Json) -> Result<Json, String> {
+        if crate::channel::current() == crate::channel::Channel::Hucre {
+            if id == "file.open"
+                && let Some(args) = params.as_object_mut()
+            {
+                args.insert("xlsxWorkbook".into(), json!(true));
+            }
+            if matches!(id, "file.save" | "file.saveAs")
+                && let Some(path) = params.get("path").and_then(Json::as_str)
+                && !gridcraft_engine::io::path_has_extension(path, "xlsx")
+            {
+                return Err("Choose a filename ending in .xlsx.".into());
+            }
+        }
         let switches_window = id.starts_with("window.")
             || matches!(id, "view.newWindow" | "view.hideWindow" | "view.unhideWindow")
             || (id == "view.switchWindows" && ["window", "doc"].iter().any(|k| params.get(*k).is_some_and(|d| !d.is_null())));
@@ -459,7 +472,7 @@ impl SheetApp {
                 }
             }
             "saveAs" => {
-                let suggested = self.session.active().map(|d| d.display_title()).unwrap_or_else(|| "Book1".into());
+                let suggested = self.xlsx_save_suggestion();
                 if let Some(pick) = &self.services.pick_save {
                     if let Some(path) = pick(&suggested) {
                         let path = if std::path::Path::new(&path).extension().is_none() { format!("{path}.xlsx") } else { path };

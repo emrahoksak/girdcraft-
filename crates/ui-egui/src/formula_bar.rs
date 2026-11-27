@@ -496,6 +496,9 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
     // Keys the editor handles itself (before the TextEdit sees them), only where it has focus.
     let focused = ui.ctx().memory(|m| m.focused());
     let has_focus = focused == Some(id) || (mine && (ed.request_focus || focused.is_none()));
+    if mine && has_focus && app.message.is_none() && app.dialog.is_none() {
+        restore_editor_input(app, ui.ctx());
+    }
     let EditorKeyOutcome { action, arrow, cancel, to_python } = editor_shortcuts(app, ui, id, &mut ed, mine, has_focus);
     // The text widget.
     let refs = formula_refs(&ed.text);
@@ -535,13 +538,16 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
         ed.keep_selection = true;
     }
     let synced = mine && !dialog_open && (ed.request_focus || ed.sync_caret);
+    if synced {
+        sync_edit_caret(ui, id, &mut ed);
+    }
     let edit = if multiline || ed.text.contains('\n') { TextEdit::multiline(&mut ed.text) } else { TextEdit::singleline(&mut ed.text) };
     let edit = edit.interactive(!dialog_open);
     let caret_index = ed.caret;
     // The in-cell editor grows with its text and never scrolls, so the field keeps its whole width
     // for the text (a scroll area would take the bar's width off it and wrap the text narrower
     // than the cell does). The formula bar shows its lines and scrolls past them.
-    let mut output = if on_sheet {
+    let output = if on_sheet {
         show_edit(edit, ui, id, font, width, &mut layouter)
     } else {
         egui::ScrollArea::vertical()
@@ -563,36 +569,13 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
     // Both editors are text inputs without a visible label next to them: name the one being shown.
     let accessible_name = (if on_sheet { app.ui.language.tr("Cell Editor") } else { app.ui.language.tr("Formula Bar") }).to_string();
     let resp = output.response.response.clone().accessible_name(accessible_name);
-    if synced {
-        if ed.request_focus {
-            resp.request_focus();
-        }
-        ed.request_focus = false;
-        // Closing a dialog that changed nothing (Cancel) gives the selection back as it was, and
-        // AutoSum's proposed range comes selected (`select_from`).
-        let range = if let Some(from) = ed.select_from.take() {
-            ed.anchor = from;
-            egui::text::CCursorRange::two(egui::text::CCursor::new(from), egui::text::CCursor::new(ed.caret))
-        } else if ed.keep_selection && !ed.sync_caret {
-            egui::text::CCursorRange::two(egui::text::CCursor::new(ed.anchor), egui::text::CCursor::new(ed.caret))
-        } else {
-            ed.anchor = ed.caret;
-            egui::text::CCursorRange::one(egui::text::CCursor::new(ed.caret))
-        };
-        ed.sync_caret = false;
-        ed.keep_selection = false;
-        output.state.cursor.set_char_range(Some(range));
-        output.state.store(ui.ctx(), id);
-    } else if resp.clicked() || resp.gained_focus() {
+    if !synced && (resp.clicked() || resp.gained_focus()) {
         // Clicking into the other editor moves editing there.
         ed.from_formula_bar = id == egui::Id::unique("gridcraft.formula_bar");
         ed.enter_mode = false;
         app.session.mode = gridcraft_engine::Mode::Edit;
     }
-    if !synced
-        && !dialog_open
-        && let Some(r) = output.cursor_range
-    {
+    if !dialog_open && let Some(r) = output.cursor_range {
         ed.caret = r.primary.index.into();
         ed.anchor = r.secondary.index.into();
     }
@@ -651,6 +634,25 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
     EditorInfo { lines, caret }
 }
 
+fn sync_edit_caret(ui: &egui::Ui, id: egui::Id, ed: &mut crate::editor::EditState) {
+    use egui::text::{CCursor, CCursorRange};
+
+    if std::mem::take(&mut ed.request_focus) {
+        ui.memory_mut(|memory| memory.request_focus(id));
+    }
+    // Restore a dialog's selection or the proposed AutoSum range before processing input.
+    if let Some(from) = ed.select_from.take() {
+        ed.anchor = from;
+    } else if !ed.keep_selection || ed.sync_caret {
+        ed.anchor = ed.caret;
+    }
+    ed.sync_caret = false;
+    ed.keep_selection = false;
+    let mut state = TextEdit::load_state(ui.ctx(), id).unwrap_or_default();
+    state.cursor.set_char_range(Some(CCursorRange::two(CCursor::new(ed.anchor), CCursor::new(ed.caret))));
+    TextEdit::store_state(ui.ctx(), id, state);
+}
+
 type EditorAction = (i64, i64, bool, bool);
 
 struct EditorKeyOutcome {
@@ -676,7 +678,7 @@ fn editor_shortcuts(
     }
     // Ctrl+Alt+Shift+P turns the edit into Python code.
     outcome.to_python = ui.input_mut(take_python_shortcut);
-    let (action, cancel, py_trigger) = editor_confirm_keys(ui, ed);
+    let (action, cancel, py_trigger) = editor_confirm_keys(app, ui, ed);
     outcome.action = action;
     outcome.cancel = cancel;
     outcome.to_python |= py_trigger;
@@ -689,18 +691,17 @@ fn editor_shortcuts(
 
 /// Enter, Tab, Esc and their variants: the move to make, whether the edit is cancelled, and
 /// whether `=PY` then Tab starts Python mode.
-fn editor_confirm_keys(ui: &mut egui::Ui, ed: &mut crate::editor::EditState) -> (Option<EditorAction>, bool, bool) {
-    let (enter, tab, esc, alt_enter, cmd_enter, ctrl_shift_enter, shift) = ui.input_mut(|i| {
-        let m = i.modifiers;
-        let alt_enter = i.consume_key(egui::Modifiers::ALT, Key::Enter) || i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::ALT, Key::Enter);
-        let ctrl_shift_enter = i.consume_key(egui::Modifiers::CTRL | egui::Modifiers::SHIFT, Key::Enter);
-        let cmd_enter = i.consume_key(egui::Modifiers::COMMAND, Key::Enter);
-        let enter = i.consume_key(egui::Modifiers::NONE, Key::Enter) || i.consume_key(egui::Modifiers::SHIFT, Key::Enter);
-        let tab = i.consume_key(egui::Modifiers::NONE, Key::Tab) || i.consume_key(egui::Modifiers::SHIFT, Key::Tab);
-        let esc = i.consume_key(egui::Modifiers::NONE, Key::Escape);
-        dismiss_completion(i, &mut ed.completion);
-        (enter, tab, esc, alt_enter, cmd_enter, ctrl_shift_enter, m.shift)
-    });
+fn editor_confirm_keys(app: &SheetApp, ui: &mut egui::Ui, ed: &mut crate::editor::EditState) -> (Option<EditorAction>, bool, bool) {
+    let key = take_confirmation(app, ui.ctx());
+    ui.input_mut(|i| dismiss_completion(i, &mut ed.completion));
+    let Some((key, m)) = key else { return (None, false, false) };
+    let shift = m.shift;
+    let enter = key == Key::Enter && !m.alt;
+    let tab = key == Key::Tab;
+    let esc = key == Key::Escape;
+    let alt_enter = key == Key::Enter && m.alt;
+    let ctrl_shift_enter = enter && m.ctrl && shift;
+    let cmd_enter = enter && (m.command || m.ctrl || m.mac_cmd);
     if alt_enter {
         let b = ed.text.char_indices().nth(ed.caret).map(|(i, _)| i).unwrap_or(ed.text.len());
         ed.text.insert(b, '\n');
@@ -747,6 +748,73 @@ fn editor_confirm_keys(ui: &mut egui::Ui, ed: &mut crate::editor::EditState) -> 
         true
     };
     (action, cancel, py_trigger)
+}
+
+pub(crate) fn is_editor_input(event: &egui::Event) -> bool {
+    matches!(
+        event,
+        egui::Event::Key { .. }
+            | egui::Event::Text(_)
+            | egui::Event::Ime(_)
+            | egui::Event::Copy
+            | egui::Event::Cut
+            | egui::Event::Paste(_)
+            | egui::Event::PasteImage(_)
+    )
+}
+
+#[derive(Clone)]
+struct EditorInputTail {
+    frame: u64,
+    sheet: Option<(u64, usize)>,
+    events: Vec<egui::Event>,
+}
+
+fn editor_input_id(ctx: &egui::Context) -> egui::Id {
+    egui::Id::unique(("gridcraft.editor_input_tail", ctx.viewport_id()))
+}
+
+/// Replay keys after an entry boundary on the next pass, ahead of any newer typing.
+pub(crate) fn restore_editor_input(app: &SheetApp, ctx: &egui::Context) {
+    let frame = ctx.cumulative_frame_nr();
+    let id = editor_input_id(ctx);
+    let pending = ctx.data_mut(|data| {
+        let tail = data.get_temp::<EditorInputTail>(id)?;
+        if frame == tail.frame {
+            return None;
+        }
+        data.remove::<EditorInputTail>(id);
+        (frame == tail.frame + 1 && app.view_key() == tail.sheet).then_some(tail.events)
+    });
+    if let Some(events) = pending {
+        ctx.input_mut(|input| input.events.splice(..0, events).for_each(drop));
+    }
+}
+
+fn take_confirmation(app: &SheetApp, ctx: &egui::Context) -> Option<(Key, egui::Modifiers)> {
+    let (key, modifiers, tail) = ctx.input_mut(|input| {
+        let (index, key, modifiers) = input.events.iter().enumerate().find_map(|(i, event)| match event {
+            egui::Event::Key { key, pressed: true, modifiers: m, .. }
+                if *key == Key::Enter
+                    || (*key == Key::Tab && !(m.alt || m.ctrl || m.command || m.mac_cmd))
+                    || (*key == Key::Escape && m.is_none()) =>
+            {
+                Some((i, *key, *m))
+            }
+            _ => None,
+        })?;
+        let (tail, other): (Vec<_>, Vec<_>) = input.events.split_off(index + 1).into_iter().partition(is_editor_input);
+        input.events.remove(index);
+        input.events.extend(other);
+        Some((key, modifiers, tail))
+    })?;
+    if !tail.is_empty() {
+        let id = editor_input_id(ctx);
+        let pending = EditorInputTail { frame: ctx.cumulative_frame_nr(), sheet: app.view_key(), events: tail };
+        ctx.data_mut(|data| data.insert_temp(id, pending));
+        ctx.request_repaint();
+    }
+    Some((key, modifiers))
 }
 
 fn editor_arrow_keys(

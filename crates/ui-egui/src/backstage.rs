@@ -770,7 +770,11 @@ pub fn export_as(app: &mut SheetApp, fmt: &str) -> bool {
     if let Some(pick) = &app.services.pick_save {
         let Some(path) = pick(&format!("{stem}.{fmt}")) else { return false };
         // The picker may suggest a workbook extension; the export writes the chosen format.
-        let path = std::path::Path::new(&path).with_extension(fmt).to_string_lossy().into_owned();
+        let path = if gridcraft_engine::io::path_has_extension(&path, fmt) {
+            path
+        } else {
+            std::path::Path::new(&path).with_extension(fmt).to_string_lossy().into_owned()
+        };
         return match app.run(id, json!({"path": path})) {
             Ok(_) => true,
             Err(e) => {

@@ -25,6 +25,7 @@ mod insert_function;
 mod names;
 mod paste;
 mod ref_edit;
+mod sheets;
 mod show;
 mod sort_dialog;
 mod spelling;
@@ -369,10 +370,30 @@ impl Dialog {
                     ],
                     json!({"to": 0, "copy": false}),
                 );
-                if let Some(s) = params.get("sheet") {
-                    d.values.insert("sheet".into(), s.clone());
+                let source = params.get("sheet").cloned().or_else(|| app.session.active()?.wb.active().map(|s| json!(s.name)));
+                if let Some(source) = source {
+                    d.values.insert("sheet".into(), source);
                 }
                 d
+            }
+            "deleteSheet" => {
+                let target = p("sheet");
+                let d = app.session.active()?;
+                let index = if let Some(name) = target.as_str() {
+                    d.wb.sheet_index(name)?
+                } else if let Some(index) = target.as_u64() {
+                    usize::try_from(index).ok()?
+                } else {
+                    d.wb.active_sheet()
+                };
+                let sheet = &d.wb.sheet(index)?.name;
+                Dialog::form(
+                    "deleteSheet",
+                    "Delete Sheet",
+                    "home.deleteSheet",
+                    vec![Note(app.ui.language.tr_fill("Delete worksheet “{sheet}”?", &[("sheet", sheet)]))],
+                    json!({"sheet": sheet}),
+                )
             }
             "protectSheet" => Dialog::form(
                 "protectSheet",

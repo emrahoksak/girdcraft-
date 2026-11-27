@@ -25,7 +25,11 @@ impl SheetApp {
         let Some(pick) = &self.services.pick_save else { return };
         let Some(path) = pick(&format!("{stem}.pdf")) else { return };
         // The picker may suggest a workbook extension; the export writes a PDF.
-        let path = std::path::Path::new(&path).with_extension("pdf").to_string_lossy().into_owned();
+        let path = if gridcraft_engine::io::path_has_extension(&path, "pdf") {
+            path
+        } else {
+            std::path::Path::new(&path).with_extension("pdf").to_string_lossy().into_owned()
+        };
         match &mut params {
             Json::Object(map) => {
                 map.insert("path".into(), Json::String(path));

@@ -195,9 +195,16 @@ fn services() -> Services {
         })),
         pick_open: Some(Box::new(|| {
             rfd::FileDialog::new()
-                .add_filter("Spreadsheets", &["xlsx", "xlsm", "xls", "xlsb", "ods", "csv", "tsv", "txt", "slk", "json"])
-                .add_filter("Excel Workbook", &["xlsx", "xlsm"])
-                .add_filter("Excel 97-2003 Workbook (import)", &["xls"])
+                .add_filter(
+                    "Spreadsheets",
+                    &[
+                        "xlsx", "xlsm", "xltx", "xltm", "xls", "xlt", "xlsb", "ods", "csv", "tsv", "tab", "txt", "slk", "html", "htm", "json",
+                        "scjson",
+                    ],
+                )
+                .add_filter("Excel Workbook (.xlsx)", &["xlsx"])
+                .add_filter("Excel Macro Workbook and Templates (import)", &["xlsm", "xltx", "xltm"])
+                .add_filter("Excel 97-2003 Workbook (import)", &["xls", "xlt"])
                 .add_filter("Excel Binary Workbook (data import)", &["xlsb"])
                 .add_filter("OpenDocument Spreadsheet (data import)", &["ods"])
                 .add_filter("CSV", &["csv"])
@@ -210,25 +217,55 @@ fn services() -> Services {
                 .pick_file()
                 .and_then(|p| p.to_str().map(str::to_string))
         })),
-        pick_save: Some(Box::new(|suggested: &str| {
-            let path = std::path::Path::new(suggested);
-            let stem = path.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("Book1").to_string();
-            // The suggested name's type (an export asks for .pdf, .csv or .html) comes first.
-            const TYPES: [(&str, &str); 4] =
-                [("Excel Workbook (.xlsx)", "xlsx"), ("CSV UTF-8 (.csv)", "csv"), ("Web Page (.html)", "html"), ("PDF (.pdf)", "pdf")];
-            let ext = path.extension().and_then(std::ffi::OsStr::to_str).map(str::to_ascii_lowercase).filter(|e| TYPES.iter().any(|(_, x)| x == e));
-            let ext = ext.unwrap_or_else(|| "xlsx".to_string());
-            let mut dialog = rfd::FileDialog::new().set_file_name(format!("{stem}.{ext}"));
-            for (label, x) in TYPES.iter().filter(|(_, x)| *x == ext).chain(TYPES.iter().filter(|(_, x)| *x != ext)) {
-                dialog = dialog.add_filter(*label, &[*x]);
-            }
-            dialog.save_file().and_then(|p| p.to_str().map(str::to_string))
-        })),
+        pick_save: Some(Box::new(pick_save_file)),
         open_url: Some(Box::new(|url: &str| open_with_system(url))),
         printers: Some(print::discover()),
         print_native: Some(print::submit()),
         ..Default::default()
     }
+}
+
+fn pick_save_file(suggested: &str) -> Option<String> {
+    const TYPES: [(&str, &str); 4] =
+        [("Excel Workbook (.xlsx)", "xlsx"), ("CSV UTF-8 (.csv)", "csv"), ("Web Page (.html)", "html"), ("PDF (.pdf)", "pdf")];
+    let suggested = std::path::Path::new(suggested);
+    let stem = suggested.file_stem().and_then(std::ffi::OsStr::to_str).unwrap_or("Book1");
+    let (label, ext) = suggested
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .and_then(|suffix| TYPES.iter().copied().find(|(_, ext)| ext.eq_ignore_ascii_case(suffix)))
+        .unwrap_or(TYPES[0]);
+    let mut picker = rfd::FileDialog::new().add_filter(label, &[ext]).set_file_name(format!("{stem}.{ext}"));
+    if let Some(folder) = suggested.parent().filter(|folder| folder.is_dir()) {
+        picker = picker.set_directory(folder);
+    }
+    let mut path = picker.save_file()?;
+    match path.extension().and_then(std::ffi::OsStr::to_str).filter(|suffix| !suffix.is_empty()) {
+        Some(suffix) if suffix.eq_ignore_ascii_case(ext) => {}
+        Some(_) => {
+            rfd::MessageDialog::new()
+                .set_title(gridcraft_ui_egui::channel::name())
+                .set_level(rfd::MessageLevel::Warning)
+                .set_description(format!("Choose a filename ending in .{ext}."))
+                .show();
+            return None;
+        }
+        None => {
+            path.set_extension(ext);
+            // Some pickers return a bare name. Confirm replacement at the final path, not the bare name.
+            if path.exists()
+                && rfd::MessageDialog::new()
+                    .set_title(gridcraft_ui_egui::channel::name())
+                    .set_description(format!("Replace the existing file {}?", path.display()))
+                    .set_buttons(rfd::MessageButtons::YesNo)
+                    .show()
+                    != rfd::MessageDialogResult::Yes
+            {
+                return None;
+            }
+        }
+    }
+    path.to_str().map(str::to_string)
 }
 
 /// Opens a URL or file with the system's default application.
@@ -328,8 +365,14 @@ fn prepare_launch() -> Option<Vec<std::ffi::OsString>> {
             report_launch_profile_error(&error);
             std::process::exit(2)
         });
-    let channel =
-        if early.profile.is_nightly() { gridcraft_ui_egui::channel::Channel::NightlyV1 } else { gridcraft_ui_egui::channel::Channel::Stable };
+    use gridcraft_ui_egui::channel::Channel;
+    let channel = if early.profile.is_nightly() {
+        Channel::NightlyV1
+    } else if cfg!(feature = "hucre-desktop") {
+        Channel::Hucre
+    } else {
+        Channel::Stable
+    };
     if let Err(error) =
         launch_profile::install(early.profile).and_then(|()| gridcraft_ui_egui::channel::select(channel, env!("GRIDCRAFT_BUILT_VERSION")))
     {
@@ -434,7 +477,7 @@ fn main() -> eframe::Result<()> {
     let nightly = gridcraft_ui_egui::channel::current() == gridcraft_ui_egui::channel::Channel::NightlyV1;
     // The restart helper a self-update spawns: it finishes the swap and relaunches, then exits.
     // A nightly has no updater, so it never runs this and never inherits a stable swap.
-    if !nightly
+    if gridcraft_ui_egui::channel::stable_services_allowed()
         && let Some(done) = craft_update::self_update::finish(&gridcraft_ui_egui::UPDATE_APP, &std::env::args_os().skip(1).collect::<Vec<_>>())
     {
         if let Err(e) = done {
@@ -445,7 +488,7 @@ fn main() -> eframe::Result<()> {
     }
     // Before `--` only: everything after it is a file, even one named `--version`.
     if arguments.iter().take_while(|a| *a != "--").any(|a| a == "--version" || a == "-V") {
-        println!("GridCraft {}", gridcraft_ui_egui::channel::version());
+        println!("{} {}", gridcraft_ui_egui::channel::name(), gridcraft_ui_egui::channel::version());
         return Ok(());
     }
     // The control channel is a stable-only service: a nightly window owns no port, writes no
@@ -454,10 +497,22 @@ fn main() -> eframe::Result<()> {
         eprintln!("GridCraft Nightly: the control channel is not part of the nightly channel");
         std::process::exit(2);
     }
-    let control_port: Option<u16> = (!nightly).then(|| std::env::var("GRIDCRAFT_CONTROL_PORT").ok().and_then(|p| p.parse().ok())).flatten();
-    let control_token: Option<String> = (!nightly).then(|| std::env::var("GRIDCRAFT_CONTROL_TOKEN").ok()).flatten();
+    let hucre = gridcraft_ui_egui::channel::current() == gridcraft_ui_egui::channel::Channel::Hucre;
+    let port_env = if hucre { "HUCRE_CONTROL_PORT" } else { "GRIDCRAFT_CONTROL_PORT" };
+    let token_env = if hucre { "HUCRE_CONTROL_TOKEN" } else { "GRIDCRAFT_CONTROL_TOKEN" };
+    let control_port: Option<u16> = (!nightly).then(|| std::env::var(port_env).ok().and_then(|p| p.parse().ok())).flatten();
+    let control_token: Option<String> = (!nightly).then(|| std::env::var(token_env).ok()).flatten();
     let parsed = desktop_args(&args, control_port, control_token);
     let (control_port, control_token, sample, files) = (parsed.control_port, parsed.control_token, parsed.sample, parsed.files);
+    if hucre && control_port.is_some() {
+        let configured = config_dir()
+            .ok_or_else(|| "Hücre ayar klasörü bulunamadı".to_owned())
+            .and_then(|root| gridcraft_mcp::control_auth::set_token_root(root.join("control")));
+        if let Err(error) = configured {
+            report_launch_profile_error(&error);
+            std::process::exit(2);
+        }
+    }
     // The log file lives in the settings folder, next to the preferences; opened after the
     // arguments, so `--version` leaves no file behind. Records logged until now are written to it
     // first. Runs without preferences (agents' test runs) log to standard error only, so they

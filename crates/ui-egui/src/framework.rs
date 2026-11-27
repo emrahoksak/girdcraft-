@@ -66,9 +66,13 @@ pub fn install_headless(ctx: &egui::Context) {
 /// Who GridCraft is to the framework's dialogs (the update dialogs show its name and icon).
 pub(crate) fn host() -> Arc<Host> {
     Arc::new(
-        Host::builder(AppInfo { id: "gridcraft", name: "GridCraft", version: env!("CARGO_PKG_VERSION") })
-            .icon_png(include_bytes!("../../../assets/app-icon/hicolor/128x128/apps/ai.storyteller.gridcraft.png"))
-            .build(),
+        Host::builder(AppInfo {
+            id: if crate::channel::current() == crate::channel::Channel::Hucre { "hucre" } else { "gridcraft" },
+            name: crate::channel::name(),
+            version: env!("CARGO_PKG_VERSION"),
+        })
+        .icon_png(include_bytes!("../../../assets/app-icon/hicolor/128x128/apps/ai.storyteller.gridcraft.png"))
+        .build(),
     )
 }
 

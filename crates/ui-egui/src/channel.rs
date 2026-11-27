@@ -22,6 +22,7 @@ pub const NIGHTLY_PACKAGE_ID: &str = "ai.storyteller.gridcraft.nightly";
 pub enum Channel {
     Stable,
     NightlyV1,
+    Hucre,
 }
 
 static SELECTED: AtomicU8 = AtomicU8::new(0);
@@ -33,19 +34,25 @@ pub fn select(channel: Channel, version: &'static str) -> Result<(), String> {
     let value = match channel {
         Channel::Stable => 1,
         Channel::NightlyV1 => 2,
+        Channel::Hucre => 3,
     };
     SELECTED.compare_exchange(0, value, Ordering::AcqRel, Ordering::Acquire).map_err(|_| "the channel was already selected".to_string())?;
     VERSION.set(version).map_err(|_| "the channel version was already selected".to_string())
 }
 
 pub fn current() -> Channel {
-    if SELECTED.load(Ordering::Acquire) == 2 { Channel::NightlyV1 } else { Channel::Stable }
+    match SELECTED.load(Ordering::Acquire) {
+        2 => Channel::NightlyV1,
+        3 => Channel::Hucre,
+        _ => Channel::Stable,
+    }
 }
 
 pub const fn id_for(channel: Channel) -> &'static str {
     match channel {
         Channel::Stable => APP_ID,
         Channel::NightlyV1 => NIGHTLY_APP_ID,
+        Channel::Hucre => "org.hucre.desktop",
     }
 }
 
@@ -57,6 +64,7 @@ pub const fn name_for(channel: Channel) -> &'static str {
     match channel {
         Channel::Stable => "GridCraft",
         Channel::NightlyV1 => "GridCraft Nightly",
+        Channel::Hucre => "Hücre",
     }
 }
 
@@ -111,7 +119,7 @@ pub fn commit() -> Option<&'static str> {
 pub fn window_title_for(channel: Channel, base: &str) -> String {
     match channel {
         Channel::Stable => base.to_string(),
-        Channel::NightlyV1 => format!("{base} \u{2014} {}", name_for(channel)),
+        Channel::NightlyV1 | Channel::Hucre => format!("{base} \u{2014} {}", name_for(channel)),
     }
 }
 

@@ -7,6 +7,10 @@ publish = false
 default-run = "gridcraft"
 description = "GridCraft desktop app"
 
+[features]
+default = ["hucre-desktop"]
+hucre-desktop = []
+
 [lints]
 workspace = true
 

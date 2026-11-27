@@ -39,6 +39,10 @@ impl SheetApp {
 
     /// Help ▸ Check for Updates…: look now, and say so when GridCraft is up to date or the check fails.
     pub fn check_for_updates(&mut self) {
+        if crate::channel::current() == crate::channel::Channel::Hucre {
+            self.message = Some(("Hücre".into(), "Bu sürümü Hücre projesinden güncelleyebilirsiniz.".into()));
+            return;
+        }
         // Never from the nightly channel: a check would download into, and record in, the stable
         // app's folders, and an install would replace a Launcher-managed copy.
         if !crate::channel::stable_services_allowed() {

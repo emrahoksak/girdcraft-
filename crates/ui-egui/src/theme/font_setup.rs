@@ -3,6 +3,25 @@ use super::Blob;
 use super::font_fallback::{load_fallback, load_preferred_arabic};
 use super::{Arc, Color32, FontData, FontDefinitions, FontFamily, FontId};
 
+pub(super) struct PaperTextCoverage;
+
+impl egui::Plugin for PaperTextCoverage {
+    fn debug_name(&self) -> &'static str {
+        "GridCraft paper text coverage"
+    }
+
+    fn input_hook(&mut self, ctx: &egui::Context, _input: &mut egui::RawInput) {
+        use egui::epaint::FontColorTransferFunction;
+
+        // The font atlas is shared with the chrome, but the sheet is white in both themes.
+        // Apply the paper curve after the framework's theme hook and before the atlas is updated.
+        let coverage = FontColorTransferFunction::LIGHT_MODE_DEFAULT;
+        if [egui::Theme::Light, egui::Theme::Dark].iter().any(|&theme| ctx.style_of(theme).visuals.text_options.color_transfer_function != coverage) {
+            ctx.all_styles_mut(|style| style.visuals.text_options.color_transfer_function = coverage);
+        }
+    }
+}
+
 /// A font from the optional craft-fonts build input (`CRAFT_FONTS_DIR` at build time; see
 /// <https://github.com/storytold/craft-fonts> and its `docs/integration.md`). The slice is empty
 /// when the app is built without the checkout; nothing is downloaded and no font is in this repo.

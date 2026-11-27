@@ -32,7 +32,11 @@ pub fn config_dir_for(platform: &str, env: &impl Fn(&str) -> Option<OsString>, n
 }
 
 pub fn config_dir() -> Option<PathBuf> {
-    config_dir_for(std::env::consts::OS, &|key| std::env::var_os(key), crate::launch_profile::current().root())
+    let dir = config_dir_for(std::env::consts::OS, &|key| std::env::var_os(key), crate::launch_profile::current().root())?;
+    if gridcraft_ui_egui::channel::current() == gridcraft_ui_egui::channel::Channel::Hucre {
+        return Some(dir.with_file_name(if cfg!(windows) || cfg!(target_os = "macos") { "Hucre" } else { "hucre" }));
+    }
+    Some(dir)
 }
 
 /// Where the log files live: `logs` in the settings folder, next to `ui.json`.

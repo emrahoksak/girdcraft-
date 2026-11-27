@@ -173,6 +173,7 @@ pub fn sheet_tabs(app: &mut SheetApp, ui: &mut Ui) {
             let Some(d) = app.session.active() else { return };
             let (bar_left, bar_width) = (ui.cursor().left(), ui.available_width());
             let uid = d.uid;
+            let can_edit_structure = !d.wb.protected_structure;
             // The track ends where the grid does, so it stops under the vertical scrollbar. A share
             // dragged in a wider window is held to the same limits as a drag at this width.
             let bar_right = app.grid.rect.map_or(bar_left + bar_width, |r| r.right()).min(bar_left + bar_width);
@@ -266,33 +267,38 @@ pub fn sheet_tabs(app: &mut SheetApp, ui: &mut Ui) {
                                             .add(egui::TextEdit::singleline(&mut text).font(theme::ui_font(13.0)).desired_width(r.width() - 12.0))
                                             .accessible_name(app.ui.language.tr("Sheet Name"));
                                         app.grid.rename_text = text.clone();
-                                        if rename_needs_focus(ed.has_focus(), ed.lost_focus()) {
+                                        if app.message.is_none() && rename_needs_focus(ed.has_focus(), ed.lost_focus()) {
                                             ed.request_focus();
                                         }
-                                        if ed.lost_focus() {
-                                            if !crate::framework::escape_pressed(ui.ctx()) && text != name {
-                                                app.run_or_alert("sheet.rename", json!({"sheet": i, "name": text}));
+                                        if ed.lost_focus() && app.message.is_none() {
+                                            if crate::framework::escape_pressed(ui.ctx()) || text == name {
+                                                app.grid.renaming_tab = None;
+                                            } else {
+                                                match app.run("sheet.rename", json!({"sheet": i, "name": text})) {
+                                                    Ok(_) => app.grid.renaming_tab = None,
+                                                    Err(error) => app.message = Some(("Rename Sheet".into(), crate::clean_error(&error))),
+                                                }
                                             }
-                                            app.grid.renaming_tab = None;
                                         }
                                     } else {
                                         ui.painter().text(r.center(), Align2::CENTER_CENTER, &name, font, if active { t.accent } else { t.text });
                                     }
-                                    // A right-click activates the tab too, as in Excel, so the menu's sheet commands (Protect
-                                    // Sheet, Select All Sheets) act on the sheet that was clicked rather than the one that was active.
+                                    // A right-click activates the tab too, so Protect Sheet applies
+                                    // to the sheet under the pointer.
                                     if resp.clicked() || (resp.secondary_clicked() && !active) {
                                         activate_sheet(app, i);
                                     }
-                                    if resp.double_clicked() {
+                                    if can_edit_structure && resp.double_clicked() {
                                         app.grid.renaming_tab = Some(i);
                                         app.grid.rename_text = name.clone();
                                     }
                                     // Drag to reorder; with the copy modifier held, drop a copy instead.
                                     let copy = drop_copies_sheet(ui.input(|inp| inp.modifiers), ui.ctx().os() == egui::os::OperatingSystem::Mac);
-                                    if resp.dragged() && copy {
+                                    if can_edit_structure && resp.dragged() && copy {
                                         ui.ctx().set_cursor_icon(egui::CursorIcon::Copy);
                                     }
-                                    if resp.drag_stopped()
+                                    if can_edit_structure
+                                        && resp.drag_stopped()
                                         && let Some(p) = ui.input(|inp| inp.pointer.interact_pos())
                                     {
                                         let dx = p.x - r.center().x;
@@ -301,60 +307,16 @@ pub fn sheet_tabs(app: &mut SheetApp, ui: &mut Ui) {
                                             app.run_or_alert("sheet.move", params);
                                         }
                                     }
-                                    resp.context_menu(|ui| {
-                                        ui.set_min_width(180.0);
-                                        if ui.button(app.ui.language.tr("Insert Sheet")).clicked() {
-                                            app.run_or_alert("home.insertSheet", json!({"before": i}));
-                                        }
-                                        if ui.button(app.ui.language.tr("Delete")).clicked() {
-                                            app.run_or_alert("home.deleteSheet", json!({"sheet": i}));
-                                        }
-                                        if ui.button(app.ui.language.tr("Rename")).clicked() {
-                                            app.grid.renaming_tab = Some(i);
-                                            app.grid.rename_text = name.clone();
-                                        }
-                                        if ui.button(app.ui.language.tr("Move or Copy…")).clicked() {
-                                            app.open_dialog("moveSheet", json!({"sheet": i}));
-                                        }
-                                        if ui.button(app.ui.language.tr("Duplicate")).clicked() {
-                                            app.run_or_alert("sheet.move", json!({"sheet": i, "to": i + 1, "copy": true}));
-                                        }
-                                        ui.menu_button(app.ui.language.tr("Tab Color"), |ui| {
-                                            let colors = app.session.active().map(|d| d.wb.theme.colors).unwrap_or_default();
-                                            if let Some(c) = crate::widgets::color_palette_fixed(ui, &colors, app.ui.language.tr("No Color")) {
-                                                app.run_or_alert("sheet.tabColor", json!({"sheet": i, "color": c}));
-                                                ui.close();
-                                            }
-                                        });
-                                        ui.separator();
-                                        if ui.button(app.ui.language.tr("Hide")).clicked() {
-                                            app.run_or_alert("sheet.hide", json!({"sheet": i}));
-                                        }
-                                        if ui.button(app.ui.language.tr("Unhide…")).clicked() {
-                                            app.run_or_alert("sheet.unhide", json!({}));
-                                        }
-                                        ui.separator();
-                                        let protected = app.active_sheet_protected();
-                                        if ui
-                                            .button(if protected {
-                                                app.ui.language.tr("Unprotect Sheet…")
-                                            } else {
-                                                app.ui.language.tr("Protect Sheet…")
-                                            })
-                                            .clicked()
-                                        {
-                                            app.open_dialog("protectSheet", json!({}));
-                                        }
-                                        if ui.button(app.ui.language.tr("Select All Sheets")).clicked() {
-                                            ui.close();
-                                        }
-                                    });
+                                    sheet_tab_context_menu(app, ui, &resp, i, &name);
                                 }
                             });
                         });
                 });
                 ui.add_space(6.0);
-                if crate::widgets::icon_button(ui, Icon::Plus, t.text_dim, app.ui.language.tr("New sheet (⇧F11)"), vec2(26.0, 26.0)).clicked() {
+                let add = ui.add_enabled_ui(can_edit_structure, |ui| {
+                    crate::widgets::icon_button(ui, Icon::Plus, t.text_dim, app.ui.language.tr("New sheet (⇧F11)"), vec2(26.0, 26.0))
+                });
+                if add.inner.clicked() {
                     app.run_or_alert("home.insertSheet", json!({}));
                 }
             }
@@ -397,6 +359,67 @@ fn fitting_statistics(widths: &[f32], room: f32, gap: f32) -> usize {
         kept += 1;
     }
     kept
+}
+
+fn sheet_tab_context_menu(app: &mut SheetApp, ui: &Ui, response: &egui::Response, sheet: usize, name: &str) {
+    use crate::widgets::{context_frame, context_row};
+
+    let lang = app.ui.language;
+    egui::Popup::context_menu(response).frame(context_frame(ui)).accessible_name(lang.tr("Sheet Tab Context Menu")).show(|ui| {
+        let (editable, can_remove, can_unhide, active) = app.session.active().map_or((false, false, false, false), |d| {
+            let editable = !d.wb.protected_structure;
+            let visible = d.wb.sheets.iter().filter(|s| s.visibility == Visibility::Visible).take(2).count();
+            let has_hidden = d.wb.sheets.iter().any(|s| s.visibility != Visibility::Visible);
+            (editable, editable && visible > 1, editable && has_hidden, d.wb.active_sheet() == sheet)
+        });
+
+        ui.set_width(220.0);
+        ui.spacing_mut().item_spacing.y = 1.0;
+        if sheet_menu_choice(ui, Icon::Insert, lang.tr("Insert Sheet"), editable) {
+            app.run_or_alert("home.insertSheet", json!({"before": sheet}));
+        }
+        if sheet_menu_choice(ui, Icon::Delete, lang.tr("Delete…"), can_remove) {
+            app.open_dialog("deleteSheet", json!({"sheet": name}));
+        }
+        ui.separator();
+        if sheet_menu_choice(ui, Icon::Pen, lang.tr("Rename"), editable) {
+            app.grid.renaming_tab = Some(sheet);
+            app.grid.rename_text = name.to_owned();
+        }
+        if sheet_menu_choice(ui, Icon::Right, lang.tr("Move or Copy…"), editable) {
+            app.open_dialog("moveSheet", json!({"sheet": name}));
+        }
+        if sheet_menu_choice(ui, Icon::Copy, lang.tr("Duplicate"), editable) {
+            app.run_or_alert("sheet.move", json!({"sheet": sheet, "to": sheet + 1, "copy": true}));
+        }
+        let color_menu = context_row(ui, Icon::Fill, lang.tr("Tab Color"), true);
+        egui::containers::menu::SubMenu::new().show(ui, &color_menu, |ui| {
+            let colors = app.session.active().map(|d| d.wb.theme.colors).unwrap_or_default();
+            if let Some(color) = crate::widgets::color_palette_fixed(ui, &colors, lang.tr("No Color")) {
+                app.run_or_alert("sheet.tabColor", json!({"sheet": sheet, "color": color}));
+                ui.close();
+            }
+        });
+        ui.separator();
+        if sheet_menu_choice(ui, Icon::Collapse, lang.tr("Hide"), can_remove) {
+            app.run_or_alert("sheet.hide", json!({"sheet": sheet}));
+        }
+        if sheet_menu_choice(ui, Icon::Expand, lang.tr("Unhide…"), can_unhide) {
+            app.run_or_alert("sheet.unhide", json!({}));
+        }
+        let protection = if app.active_sheet_protected() { "Unprotect Sheet…" } else { "Protect Sheet…" };
+        if sheet_menu_choice(ui, Icon::Lock, lang.tr(protection), active) {
+            app.open_dialog("protectSheet", json!({}));
+        }
+    });
+}
+
+fn sheet_menu_choice(ui: &mut Ui, icon: Icon, label: &str, enabled: bool) -> bool {
+    let clicked = ui.add_enabled_ui(enabled, |ui| crate::widgets::context_item(ui, icon, label)).inner.clicked();
+    if clicked {
+        ui.close();
+    }
+    clicked
 }
 
 /// Draws status mode/messages, zoom controls/view-mode buttons and selection statistics.
