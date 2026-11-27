@@ -73,6 +73,8 @@ impl SheetApp {
         let mut ed = editor::EditState::new(d.uid, d.wb.active_sheet(), at, text, replace, from_formula_bar).on_sheet(&d.wb);
         ed.window = self.session.active_window();
         ed.locale = locale;
+        ed.text_format =
+            (replace || sh.cell(at).is_none_or(|cell| cell.formula.is_none())) && d.wb.styles.get(sh.style_id(at)).num_fmt.as_str() == "@";
         // A list validation with an in-cell dropdown is searched as the user types; its list
         // replaces column AutoComplete.
         let list = sh
@@ -304,7 +306,12 @@ impl SheetApp {
     }
 
     pub fn cancel_edit(&mut self) {
-        self.editor = None;
+        if let Some(ed) = self.editor.take()
+            && ed.off_sheet(self.view_key())
+            && let Some(sheet) = self.session.active().and_then(|d| ed.sheet_in(&d.wb))
+        {
+            let _ = self.session.run("sheet.activate", json!({"sheet": sheet}));
+        }
         self.session.mode = gridcraft_engine::Mode::Ready;
     }
 

@@ -33,6 +33,10 @@ pub struct EditState {
     /// Started by typing (Enter mode: arrows commit) rather than F2 (Edit mode: arrows move the caret).
     pub enter_mode: bool,
     pub from_formula_bar: bool,
+    /// Arrow keys can point in a formula independently of which editor surface owns the draft.
+    pub point_keys: bool,
+    /// Text format accepts what was typed without interpreting formulas.
+    pub text_format: bool,
     /// Caret position (char index), mirrored from the text widget.
     pub caret: usize,
     /// The other end of the selected text (char index), mirrored like `caret`; equal to `caret`
@@ -119,6 +123,7 @@ impl EditState {
     pub fn new(doc: u64, sheet: usize, cell: CellRef, text: String, enter_mode: bool, from_formula_bar: bool) -> EditState {
         let caret = text.chars().count();
         let original = (!enter_mode).then(|| text.clone());
+        let point_keys = enter_mode || (from_formula_bar && text.is_empty());
         EditState {
             doc,
             window: None,
@@ -131,6 +136,8 @@ impl EditState {
             text,
             enter_mode,
             from_formula_bar,
+            point_keys,
+            text_format: false,
             caret,
             anchor: caret,
             point: None,
@@ -300,16 +307,49 @@ impl EditState {
         self.sync_caret = true;
     }
 
-    /// Whether the text is a formula (never in Python mode: there it is code).
-    pub fn is_formula(&self) -> bool {
-        !self.python
-            && (self.text.starts_with('=')
-                || (self.text.starts_with('+') && self.text.len() > 1)
-                || (self.text.starts_with('-') && self.text.len() > 1 && !self.text[1..].starts_with(|c: char| c.is_ascii_digit())))
+    pub fn off_sheet(&self, view: Option<(u64, usize)>) -> bool {
+        view.is_some_and(|(doc, sheet)| doc == self.doc && sheet != self.sheet)
     }
 
-    fn byte_caret(&self) -> usize {
-        self.text.char_indices().nth(self.caret).map(|(i, _)| i).unwrap_or(self.text.len())
+    /// A sign on its own can start pointing even though it commits as literal text.
+    pub fn is_formula(&self) -> bool {
+        if self.python || self.text_format {
+            return false;
+        }
+        if self.text.starts_with('=') {
+            return true;
+        }
+        if !self.text.starts_with(['+', '-']) {
+            return false;
+        }
+        if self.text.len() == 1 {
+            return true;
+        }
+        let decimal = self.locale.decimal_separator();
+        if decimal != '.' && self.text.contains(decimal) {
+            let normalized = self.text.replace(decimal, ".");
+            if normalized.strip_suffix('%').unwrap_or(&normalized).parse::<f64>().is_ok_and(f64::is_finite) {
+                return false;
+            }
+        }
+        gridcraft_engine::core::parse::starts_formula(&self.text)
+    }
+
+    fn byte_position(&self, character: usize) -> usize {
+        self.text.char_indices().nth(character).map_or(self.text.len(), |(i, _)| i)
+    }
+
+    pub(crate) fn byte_caret(&self) -> usize {
+        self.byte_position(self.caret)
+    }
+
+    fn reference_insertion(&self) -> (usize, usize) {
+        if let Some(point) = self.point.filter(|_| self.point_at_caret()) {
+            return point;
+        }
+        let caret = self.byte_caret();
+        let anchor = if self.sync_caret { caret } else { self.byte_position(self.anchor) };
+        (anchor.min(caret), anchor.max(caret))
     }
 
     /// Point mode: the caret follows an operator, `(`, `,` or `=` in a formula, so clicking a
@@ -321,9 +361,10 @@ impl EditState {
         if self.point_at_caret() {
             return true;
         }
-        let before = self.text.get(..self.byte_caret()).unwrap_or("");
+        let before = self.text.get(..self.reference_insertion().0).unwrap_or("");
         let last = before.trim_end().chars().last();
         matches!(last, Some('=' | '(' | ',' | '+' | '-' | '*' | '/' | '^' | '&' | '<' | '>' | ':' | ';' | '{'))
+            && before.bytes().filter(|&b| b == b'"').count() % 2 == 0
     }
 
     pub fn point_at_caret(&self) -> bool {
@@ -332,16 +373,23 @@ impl EditState {
 
     /// Inserts (or replaces the last pointed) reference text at the caret.
     pub fn insert_ref(&mut self, r: &str) {
-        let caret_b = self.byte_caret();
-        let (start, end) = match self.point {
-            Some((s, e)) if e == caret_b => (s, e),
-            _ => (caret_b, caret_b),
-        };
-        let (Some(a), Some(b)) = (self.text.get(..start), self.text.get(end..)) else { return };
-        self.text = format!("{a}{r}{b}");
+        let (start, end) = self.reference_insertion();
+        let retained = self
+            .point
+            .filter(|&span| span == (start, end) && self.point_at_caret())
+            .and_then(|_| self.text.get(start..end))
+            .filter(|reference| reference.contains('$'))
+            .and_then(|reference| crate::dialogs::inherit_anchors(r, reference));
+        let r = retained.as_deref().unwrap_or(r);
+        if self.text.get(start..end) != Some(r) {
+            self.text.replace_range(start..end, r);
+        }
         let new_end = start + r.len();
         self.point = Some((start, new_end));
         self.caret = self.text.get(..new_end).map(|s| s.chars().count()).unwrap_or(0);
+        self.anchor = self.caret;
+        self.autocomplete.clear();
+        self.completion = None;
         self.caret_to_end = false;
         self.sync_caret = true;
     }
@@ -376,6 +424,10 @@ impl EditState {
         if let Some((start, end)) = self.point {
             self.point = Some((start + separator.len(), end));
         }
+    }
+
+    pub(crate) fn references(&self) -> Vec<(usize, usize, RangeRef, Option<String>, usize)> {
+        if self.is_formula() { formula_refs_in(&self.text, self.locale) } else { Vec::new() }
     }
 
     /// Updates function autocomplete for the word before the caret.
@@ -522,9 +574,13 @@ impl EditState {
 /// References in formula text with their byte spans and colour index (same reference text ⇒
 /// same colour), for colouring the editor and outlining ranges on the grid.
 pub fn formula_refs(text: &str) -> Vec<(usize, usize, RangeRef, Option<String>, usize)> {
+    formula_refs_in(text, Default::default())
+}
+
+fn formula_refs_in(text: &str, locale: gridcraft_engine::formula::FormulaLocale) -> Vec<(usize, usize, RangeRef, Option<String>, usize)> {
     let body = text.strip_prefix('=').or_else(|| text.strip_prefix('+')).unwrap_or(text);
     let offset = text.len() - body.len();
-    let Ok(toks) = gridcraft_engine::formula::lexer::tokenize(body) else { return vec![] };
+    let Ok(toks) = gridcraft_engine::formula::lexer::tokenize_locale(body, locale) else { return vec![] };
     let mut out: Vec<(usize, usize, RangeRef, Option<String>, usize)> = Vec::new();
     let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut i = 0;
@@ -534,7 +590,13 @@ pub fn formula_refs(text: &str) -> Vec<(usize, usize, RangeRef, Option<String>, 
             Tok::Sheet(a, _) => (Some(a.clone()), toks[i].start, i + 1),
             _ => (None, toks[i].start, i),
         };
-        if let Some(Tok::Word(w)) = toks.get(j).map(|t| &t.tok) {
+        if let Some(first) = toks.get(j).and_then(|t| match &t.tok {
+            Tok::Word(word) => Some(std::borrow::Cow::Borrowed(word.as_str())),
+            Tok::Number(n) if n.fract() == 0.0 && *n >= 1.0 && matches!(toks.get(j + 1).map(|t| &t.tok), Some(Tok::Colon | Tok::Trim(_))) => {
+                Some(std::borrow::Cow::Owned(n.to_string()))
+            }
+            _ => None,
+        }) {
             let range_end = if matches!(toks.get(j + 1).map(|t| &t.tok), Some(Tok::Colon | Tok::Trim(_))) {
                 toks.get(j + 2).and_then(|token| {
                     let end = match &token.tok {
@@ -542,7 +604,7 @@ pub fn formula_refs(text: &str) -> Vec<(usize, usize, RangeRef, Option<String>, 
                         Tok::Number(n) if n.fract() == 0.0 && *n >= 1.0 => Some(format!("{n}")),
                         _ => None,
                     }?;
-                    RangeRef::parse(&format!("{w}:{end}")).map(|range| (range, token.end))
+                    RangeRef::parse(&format!("{first}:{end}")).map(|range| (range, token.end))
                 })
             } else {
                 None
@@ -550,7 +612,7 @@ pub fn formula_refs(text: &str) -> Vec<(usize, usize, RangeRef, Option<String>, 
             let (range, end) = if let Some(range_end) = range_end {
                 i = j + 3;
                 range_end
-            } else if let Some(c) = CellRef::parse(w) {
+            } else if let Some(c) = CellRef::parse(&first) {
                 i = j + 1;
                 (RangeRef::cell(c), toks[j].end)
             } else {

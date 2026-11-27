@@ -362,6 +362,7 @@ impl<F: Fn(&mut SheetApp, egui::Vec2) -> Geo> ActiveCellVisibility<'_, F> {
 fn show_grid_interactions(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &Geo, sh: &Sheet, wb: &Workbook) {
     let window = app.session.active_window();
     let previous_popups = (app.grid.filter_menu, app.grid.list_picker, app.grid.header_menu, app.grid.fill_menu);
+    let paint_editor_first = prepare_formula_pick(app, ui, resp, geo, sh, wb);
     // A pan the grid never saw end (it was hidden mid-drag) must not swallow the next press.
     if app.grid.touch_pan && !resp.dragged() && !resp.drag_stopped() {
         app.grid.touch_pan = false;
@@ -386,7 +387,7 @@ fn show_grid_interactions(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Re
     }
     update_cursor(app, ui, resp, geo, sh);
     crate::text_box::show(app, ui, geo, sh);
-    if app.editor.as_ref().is_some_and(|e| !e.from_formula_bar) {
+    if !paint_editor_first && app.editor.as_ref().is_some_and(|e| !e.from_formula_bar) {
         in_cell_editor(app, ui, geo, sh, wb);
     }
     list_search(app, ui, geo, sh);
@@ -399,6 +400,46 @@ fn show_grid_interactions(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Re
     object_menu(app, ui);
     error_check_tag(app, ui, geo, sh);
     crate::quick_analysis::show(app, ui, geo, sh);
+}
+
+/// The cell editor is normally painted after the grid handles the mouse. Apply earlier typing
+/// first when the event batch also contains a click, so `+2*` is seen as a formula on that click.
+fn prepare_formula_pick(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Response, geo: &Geo, sh: &Sheet, wb: &Workbook) -> bool {
+    let primary = egui::PointerButton::Primary;
+    if !resp.clicked_by(primary) && !resp.drag_started_by(primary) {
+        return false;
+    }
+    let in_cell = app.editor.as_ref().is_some_and(|ed| !ed.from_formula_bar && app.view_key() == Some((ed.doc, ed.sheet)));
+    if !in_cell && app.editor.is_some() {
+        return false;
+    }
+    let ctx = ui.ctx().clone();
+    let typing = ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .take_while(|event| !crate::formula_bar::is_primary_pointer(event))
+            .filter_map(|event| match event {
+                egui::Event::Text(text) | egui::Event::Paste(text) | egui::Event::Ime(egui::ImeEvent::Commit(text)) => Some(text),
+                _ => None,
+            })
+            .next()
+            .is_some_and(|text| in_cell || text.starts_with(['=', '+', '-']))
+    });
+    if !typing {
+        return false;
+    }
+    crate::formula_bar::defer_input_after_pointer(app, &ctx);
+    if in_cell {
+        if let Some(ed) = app.editor.as_mut() {
+            ed.request_focus = true;
+            ed.keep_selection = true;
+        }
+        in_cell_editor(app, ui, geo, sh, wb);
+    } else {
+        super::keyboard::keyboard(app, &ctx, resp, geo, sh);
+    }
+    in_cell
 }
 
 fn update_zoom_glide(app: &mut SheetApp, ui: &egui::Ui, place: (u64, usize), zoom: u16, now: f64) {

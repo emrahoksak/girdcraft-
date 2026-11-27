@@ -138,6 +138,7 @@ pub enum Drag {
     Select,
     Rows(u32),
     Cols(u32),
+    PointCells,
     /// Point mode over the row headers: the formula's reference runs from this row to the pointer.
     PointRows(u32),
     /// Point mode over the column headers: the formula's reference runs from this column to the pointer.

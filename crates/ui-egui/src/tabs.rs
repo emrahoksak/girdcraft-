@@ -32,7 +32,14 @@ fn edge_sheet(sheets: &[Arc<Sheet>], last: bool) -> Option<usize> {
 /// other sheet; otherwise the edit is committed first.
 fn activate_sheet(app: &mut SheetApp, i: usize) {
     if app.editor.as_ref().is_some_and(|e| e.can_point()) {
-        let _ = app.session.run("sheet.activate", json!({"sheet": i}));
+        if let Err(error) = app.session.run("sheet.activate", json!({"sheet": i})) {
+            app.alert(error);
+        } else if let Some(ed) = app.editor.as_mut() {
+            ed.point_cell = None;
+            ed.point_anchor = None;
+            ed.request_focus = true;
+            ed.keep_selection = true;
+        }
     } else {
         if app.editor.is_some() && !app.commit_edit(0, 0, false, false) {
             return;

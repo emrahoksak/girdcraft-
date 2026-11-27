@@ -37,7 +37,7 @@ use data::{abs, data_validation_fields, remove_duplicates_range, validation_defa
 use find::go_to_entries;
 pub(crate) use names::insert_name;
 use names::pasteable_names;
-pub(crate) use ref_edit::SHEET_DELETED;
+pub(crate) use ref_edit::{SHEET_DELETED, cycle_anchors, inherit_anchors};
 pub(crate) use show::build_params;
 pub use show::show;
 pub(crate) use sort_dialog::{grid_sense, refuse_sheet_change};

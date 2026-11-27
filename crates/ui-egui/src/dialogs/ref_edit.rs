@@ -412,6 +412,14 @@ struct Anchors {
     row_abs: bool,
 }
 
+impl Anchors {
+    fn print(&self, col_abs: bool, row_abs: bool) -> String {
+        let col = if col_abs && !self.letters.is_empty() { "$" } else { "" };
+        let row = if row_abs && !self.digits.is_empty() { "$" } else { "" };
+        format!("{col}{}{row}{}", self.letters, self.digits)
+    }
+}
+
 /// Reads `part` as a cell (`A1`), a column (`A`) or a row (`3`) with its anchors: at most three
 /// letters and seven digits, nothing else. A `$` alone before the digits of a row anchors the row.
 fn anchors(part: &str) -> Option<Anchors> {
@@ -471,15 +479,29 @@ pub(crate) fn cycle_anchors(reference: &str) -> String {
             (true, false) => (false, false),
         }
     };
-    let anchor = |on: bool, text: &str| if on && !text.is_empty() { format!("${text}") } else { text.to_string() };
     areas
         .iter()
         .map(|(prefix, parts)| {
-            let body: Vec<String> = parts.iter().map(|a| format!("{}{}", anchor(col_abs, &a.letters), anchor(row_abs, &a.digits))).collect();
+            let body: Vec<String> = parts.iter().map(|a| a.print(col_abs, row_abs)).collect();
             format!("{prefix}{}", body.join(":"))
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Retain the anchor style when the user moves or extends a pointed reference after F4.
+pub(crate) fn inherit_anchors(reference: &str, previous: &str) -> Option<String> {
+    let unqualified = previous.rsplit('!').next()?;
+    let mut old_parts = unqualified.split(':');
+    let first = anchors(old_parts.next()?)?;
+    let (second_col, second_row) = old_parts.next().and_then(anchors).map_or((first.col_abs, first.row_abs), |a| (a.col_abs, a.row_abs));
+    let (prefix, body) = reference.rsplit_once('!').map_or(("", reference), |(sheet, body)| (&reference[..sheet.len() + 1], body));
+    let mut new_parts = body.split(':');
+    let start = anchors(new_parts.next()?)?.print(first.col_abs, first.row_abs);
+    match new_parts.next() {
+        Some(end) => Some(format!("{prefix}{start}:{}", anchors(end)?.print(second_col, second_row))),
+        None => Some(format!("{prefix}{start}")),
+    }
 }
 
 #[cfg(test)]

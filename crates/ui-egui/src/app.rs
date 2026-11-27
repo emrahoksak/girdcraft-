@@ -234,7 +234,7 @@ impl SheetApp {
             widgets::notice_bar(self, ui);
             // Python mode edits only in the formula bar: it shows while a Python edit is open,
             // also when the preference hides it.
-            if self.session.prefs.formula_bar || self.editor.as_ref().is_some_and(|e| e.python) {
+            if self.session.prefs.formula_bar || self.editor.as_ref().is_some_and(|e| e.python || e.off_sheet(self.view_key())) {
                 formula_bar::show(self, ui);
             }
             if self.ui.status_bar {

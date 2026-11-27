@@ -11,6 +11,7 @@ Windows derlemesinin dosya adı `target/release/gridcraft.exe`, uygulama adı **
 ## Masaüstü iş akışları
 
 - Hücre içinde hızlı yazma ve Enter ile onay, tuş olaylarının sırasını korur. Shift+Enter ve Shift+Tab ters yönde ilerler.
+- Bir hücreye `+2*` yazıp A1'e tıklayın. A1 formüle eklenir ve düzenleme açık kalır. Aralık için sürükleyin. Başka bir sayfadan başvuru almak için önce o sayfanın sekmesine tıklayın. Formül açıkken F2, ok tuşlarının imleci veya hücre başvurusunu hareket ettirmesini seçer. F4, başvurunun `$` sabitlemelerini değiştirir.
 - Hücre, satır, sütun ve sayfa sekmesi menülerinde simgeler bulunur. Menü tuşu veya Shift+F10, ızgaradaki seçime uygun menüyü açar. Hücre menüsü düzenleme, kaydırarak ekleme ve silme, sıralama, filtre, sayı biçimi ve dondurma seçeneklerini içerir.
 - Tablo başlığındaki filtre açılır listesi yalnızca doğru tablonun seçeneklerini gösterir. Filtreyi uygulamak veya temizlemek için ilgili düğmeyi kullanın.
 - Sayfa taşıma ve gösterme adla seçim yapar. Sayfa silme onay ister.
@@ -20,6 +21,7 @@ Windows derlemesinin dosya adı `target/release/gridcraft.exe`, uygulama adı **
 
 - 27 Kasım 2026. Koyu temadaki beyaz sayfa üzerinde normal hücre metninin yazı yumuşatması düzeltildi. Sağ tık menüleri ikon, kısayol ve alt menülerle güncellendi.
 - 27 Kasım 2026. Hücre girişi, tablo filtreleri, Türkçe sayfa yönetimi ve XLSX kayıt akışı iyileştirildi. Uzun filtre listelerinde yalnızca görünür seçenekler çiziliyor.
+- 27 Kasım 2026. Fareyle formül başvurusu seçerken yazı ve tıklama sırası düzeltildi. Aralık seçimi, sayfalar arası düzenleme odağı ve F2/F4 akışları güncellendi.
 - Excel'de aç-kaydet döngüsünün karşılaştırılması ve büyük çalışma kitaplarında bellek ölçümü doğrulama bekliyor.
 
 GridCraft telifi © 2026 ArtCraft Team and the GridCraft contributors. [MIT lisansı](../LICENSE-MIT) · [Üçüncü taraf bildirimleri](../NOTICE)

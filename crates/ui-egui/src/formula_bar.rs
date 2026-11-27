@@ -6,7 +6,6 @@ use serde_json::json;
 
 use crate::SheetApp;
 use crate::code_editor::{self, FieldOptions, Lang};
-use crate::editor::formula_refs;
 use crate::icons::{self, Icon};
 use crate::theme::{self, Tokens};
 
@@ -492,16 +491,23 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
         return python_editor(app, ui, id, width, max_height);
     }
     let Some(mut ed) = app.editor.take() else { return EditorInfo::default() };
-    let mine = ed.from_formula_bar == (id == egui::Id::unique("gridcraft.formula_bar"));
+    let off_sheet = ed.off_sheet(app.view_key());
+    let in_bar = id == egui::Id::unique("gridcraft.formula_bar");
+    let mine = (ed.from_formula_bar || off_sheet) == in_bar;
     // Keys the editor handles itself (before the TextEdit sees them), only where it has focus.
     let focused = ui.ctx().memory(|m| m.focused());
     let has_focus = focused == Some(id) || (mine && (ed.request_focus || focused.is_none()));
     if mine && has_focus && app.message.is_none() && app.dialog.is_none() {
+        if focused.is_none() {
+            ed.request_focus = true;
+            ed.keep_selection = true;
+        }
         restore_editor_input(app, ui.ctx());
+        sequence_editor_input(app, ui.ctx(), &ed);
     }
     let EditorKeyOutcome { action, arrow, cancel, to_python } = editor_shortcuts(app, ui, id, &mut ed, mine, has_focus);
     // The text widget.
-    let refs = formula_refs(&ed.text);
+    let refs = ed.references();
     let t = Tokens::get(ui.ctx());
     let on_sheet = id == egui::Id::unique("gridcraft.cell_editor");
     let cell_text_color = if on_sheet { t.cell_text } else { t.text };
@@ -532,7 +538,7 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
     let chars_before = ed.text.chars().count();
     // A dialog opened over the edit (Paste Name) takes the keyboard until it closes, and the
     // editor takes it back afterwards.
-    let dialog_open = app.dialog.is_some();
+    let dialog_open = app.dialog.is_some() || app.message.is_some();
     if dialog_open && mine {
         ed.request_focus = true;
         ed.keep_selection = true;
@@ -569,13 +575,17 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
     // Both editors are text inputs without a visible label next to them: name the one being shown.
     let accessible_name = (if on_sheet { app.ui.language.tr("Cell Editor") } else { app.ui.language.tr("Formula Bar") }).to_string();
     let resp = output.response.response.clone().accessible_name(accessible_name);
-    if !synced && (resp.clicked() || resp.gained_focus()) {
+    let moved_here = !dialog_open && !mine && !off_sheet && (resp.clicked() || resp.gained_focus());
+    if moved_here {
         // Clicking into the other editor moves editing there.
-        ed.from_formula_bar = id == egui::Id::unique("gridcraft.formula_bar");
+        ed.from_formula_bar = in_bar;
         ed.enter_mode = false;
-        app.session.mode = gridcraft_engine::Mode::Edit;
+        ed.point_keys = false;
     }
-    if !dialog_open && let Some(r) = output.cursor_range {
+    if !dialog_open
+        && (mine || moved_here)
+        && let Some(r) = output.cursor_range
+    {
         ed.caret = r.primary.index.into();
         ed.anchor = r.secondary.index.into();
     }
@@ -604,7 +614,9 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
             })
             .collect();
         ed.update_autocomplete(&names);
-        app.session.mode = if ed.can_point() {
+    }
+    if mine || moved_here {
+        app.session.mode = if ed.can_point() && (ed.point_keys || ed.point_at_caret()) {
             gridcraft_engine::Mode::Point
         } else if ed.enter_mode {
             gridcraft_engine::Mode::Enter
@@ -624,11 +636,13 @@ pub fn editor_widget(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, font: 
     app.editor = Some(ed);
     if cancel {
         app.cancel_edit();
+        ui.input_mut(|input| input.events.retain(|event| !is_editor_input(event)));
+        retarget_editor_input(app, ui.ctx());
     } else if let Some((dr, dc, array, fill)) = action {
-        if arrow {
-            app.commit_edit_arrow(dr, dc);
-        } else {
-            app.commit_edit(dr, dc, array, fill);
+        let committed = if arrow { app.commit_edit_arrow(dr, dc) } else { app.commit_edit(dr, dc, array, fill) };
+        if committed {
+            ui.input_mut(|input| input.events.retain(|event| !is_editor_input(event)));
+            retarget_editor_input(app, ui.ctx());
         }
     }
     EditorInfo { lines, caret }
@@ -678,6 +692,9 @@ fn editor_shortcuts(
     }
     // Ctrl+Alt+Shift+P turns the edit into Python code.
     outcome.to_python = ui.input_mut(take_python_shortcut);
+    if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::F2)) {
+        toggle_point_keys(app, ed);
+    }
     let (action, cancel, py_trigger) = editor_confirm_keys(app, ui, ed);
     outcome.action = action;
     outcome.cancel = cancel;
@@ -766,6 +783,7 @@ pub(crate) fn is_editor_input(event: &egui::Event) -> bool {
 #[derive(Clone)]
 struct EditorInputTail {
     frame: u64,
+    window: Option<u64>,
     sheet: Option<(u64, usize)>,
     events: Vec<egui::Event>,
 }
@@ -784,11 +802,97 @@ pub(crate) fn restore_editor_input(app: &SheetApp, ctx: &egui::Context) {
             return None;
         }
         data.remove::<EditorInputTail>(id);
-        (frame == tail.frame + 1 && app.view_key() == tail.sheet).then_some(tail.events)
+        (frame == tail.frame + 1 && app.session.active_window() == tail.window && app.view_key() == tail.sheet).then_some(tail.events)
     });
     if let Some(events) = pending {
         ctx.input_mut(|input| input.events.splice(..0, events).for_each(drop));
     }
+}
+
+pub(crate) fn is_primary_pointer(event: &egui::Event) -> bool {
+    matches!(event, egui::Event::PointerButton { button: egui::PointerButton::Primary, .. })
+}
+
+pub(crate) fn defer_input_after_pointer(app: &SheetApp, ctx: &egui::Context) {
+    let tail = ctx.input_mut(|input| {
+        let Some(index) = input.events.iter().position(is_primary_pointer) else { return Vec::new() };
+        split_editor_input(input, index + 1)
+    });
+    keep_editor_input(app, ctx, tail);
+}
+
+fn split_editor_input(input: &mut egui::InputState, boundary: usize) -> Vec<egui::Event> {
+    let (tail, other): (Vec<_>, Vec<_>) = input.events.split_off(boundary).into_iter().partition(is_editor_input);
+    input.events.extend(other);
+    tail
+}
+
+fn keep_editor_input(app: &SheetApp, ctx: &egui::Context, mut events: Vec<egui::Event>) {
+    if !events.is_empty() {
+        let frame = ctx.cumulative_frame_nr();
+        let window = app.session.active_window();
+        let sheet = app.view_key();
+        let id = editor_input_id(ctx);
+        ctx.data_mut(|data| {
+            if let Some(kept) =
+                data.get_temp::<EditorInputTail>(id).filter(|tail| tail.frame == frame && tail.window == window && tail.sheet == sheet)
+            {
+                events.extend(kept.events);
+            }
+            data.insert_temp(id, EditorInputTail { frame, window, sheet, events });
+        });
+        ctx.request_repaint();
+    }
+}
+
+fn retarget_editor_input(app: &SheetApp, ctx: &egui::Context) {
+    let id = editor_input_id(ctx);
+    let frame = ctx.cumulative_frame_nr();
+    ctx.data_mut(|data| {
+        if let Some(mut tail) = data.get_temp::<EditorInputTail>(id)
+            && tail.frame == frame
+            && tail.window == app.session.active_window()
+            && tail.sheet.map(|(doc, _)| doc) == app.view_key().map(|(doc, _)| doc)
+        {
+            tail.sheet = app.view_key();
+            data.insert_temp(id, tail);
+        }
+    });
+}
+
+/// A key that interprets the draft must see text and caret movement that arrived before it.
+/// Keep one such key per frame and let TextEdit consume the preceding edits first.
+fn sequence_editor_input(app: &SheetApp, ctx: &egui::Context, ed: &crate::editor::EditState) {
+    let tail = ctx.input_mut(|input| {
+        let mut changed = false;
+        let boundary = input.events.iter().enumerate().find_map(|(index, event)| {
+            match event {
+                egui::Event::Key { key, pressed: true, modifiers: m, .. }
+                    if matches!(key, Key::Enter | Key::F2 | Key::F3 | Key::F4)
+                        || (*key == Key::Tab && !(m.alt || m.ctrl || m.command || m.mac_cmd))
+                        || (*key == Key::Escape && m.is_none())
+                        || (ed.enter_mode || ed.point_keys || ed.list_open() || !ed.autocomplete.is_empty())
+                            && matches!(key, Key::ArrowUp | Key::ArrowDown | Key::ArrowLeft | Key::ArrowRight) =>
+                {
+                    return Some(index + usize::from(!changed));
+                }
+                egui::Event::Text(_)
+                | egui::Event::Paste(_)
+                | egui::Event::Cut
+                | egui::Event::Ime(_)
+                | egui::Event::Key {
+                    key: Key::Backspace | Key::Delete | Key::Home | Key::End | Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown,
+                    pressed: true,
+                    ..
+                } => changed = true,
+                _ => {}
+            }
+            None
+        });
+        let Some(boundary) = boundary else { return Vec::new() };
+        split_editor_input(input, boundary)
+    });
+    keep_editor_input(app, ctx, tail);
 }
 
 fn take_confirmation(app: &SheetApp, ctx: &egui::Context) -> Option<(Key, egui::Modifiers)> {
@@ -803,17 +907,11 @@ fn take_confirmation(app: &SheetApp, ctx: &egui::Context) -> Option<(Key, egui::
             }
             _ => None,
         })?;
-        let (tail, other): (Vec<_>, Vec<_>) = input.events.split_off(index + 1).into_iter().partition(is_editor_input);
+        let tail = split_editor_input(input, index + 1);
         input.events.remove(index);
-        input.events.extend(other);
         Some((key, modifiers, tail))
     })?;
-    if !tail.is_empty() {
-        let id = editor_input_id(ctx);
-        let pending = EditorInputTail { frame: ctx.cumulative_frame_nr(), sheet: app.view_key(), events: tail };
-        ctx.data_mut(|data| data.insert_temp(id, pending));
-        ctx.request_repaint();
-    }
+    keep_editor_input(app, ctx, tail);
     Some((key, modifiers))
 }
 
@@ -858,7 +956,7 @@ fn editor_arrow_keys(
         ed.ac_index = if down { (ed.ac_index + 1) % n } else { (ed.ac_index + n - 1) % n };
         return (action, false);
     }
-    if !ed.enter_mode || (!up && !down && !left && !right) || ed.from_formula_bar {
+    if (!ed.enter_mode && !ed.point_keys) || (!up && !down && !left && !right) {
         return (action, false);
     }
     let (dr, dc) = if up {
@@ -872,7 +970,7 @@ fn editor_arrow_keys(
     };
     let rtl = app.session.active().and_then(|d| d.wb.active()).is_some_and(|s| s.right_to_left);
     let dc = if rtl { -dc } else { dc };
-    if ed.can_point() {
+    if ed.point_keys && ed.can_point() {
         // Ctrl+arrow (⌘arrow) jumps the pointed cell to the edge of its data, Ctrl+Shift+arrow
         // extends the pointed range there, as the same keys do on the selection.
         ui.input_mut(|i| {
@@ -886,9 +984,11 @@ fn editor_arrow_keys(
         });
         crate::grid::point_move(app, ed, dr, dc, shift, jump);
         (action, false)
-    } else {
+    } else if ed.enter_mode {
         action = Some((dr, dc, false, false));
         (action, true)
+    } else {
+        (action, false)
     }
 }
 
@@ -968,38 +1068,51 @@ fn python_editor(app: &mut SheetApp, ui: &mut egui::Ui, id: egui::Id, width: f32
     info
 }
 
-fn cycle_anchor(ed: &mut crate::editor::EditState) {
-    let caret_b = ed.text.char_indices().nth(ed.caret).map(|(i, _)| i).unwrap_or(ed.text.len());
-    for (a, b, ..) in formula_refs(&ed.text) {
-        if a <= caret_b && caret_b <= b {
-            let Some(r) = ed.text.get(a..b) else { return };
-            let cycled: String = r
-                .split(':')
-                .map(|part| {
-                    let p = part.split('!').next_back().unwrap_or(part);
-                    let prefix = &part[..part.len() - p.len()];
-                    let bare = p.replace('$', "");
-                    let letters: String = bare.chars().take_while(|c| c.is_ascii_alphabetic()).collect();
-                    let digits = &bare[letters.len()..];
-                    let state = (p.starts_with('$'), p[letters.len().min(p.len())..].contains('$') || p.trim_start_matches('$').contains('$'));
-                    let next = match state {
-                        (false, false) => format!("${letters}${digits}"),
-                        (true, true) => format!("{letters}${digits}"),
-                        (false, true) => format!("${letters}{digits}"),
-                        (true, false) => format!("{letters}{digits}"),
-                    };
-                    format!("{prefix}{next}")
-                })
-                .collect::<Vec<_>>()
-                .join(":");
-            let (Some(x), Some(y)) = (ed.text.get(..a), ed.text.get(b..)) else { return };
-            ed.text = format!("{x}{cycled}{y}");
-            ed.caret = ed.text.get(..a + cycled.len()).map(|s| s.chars().count()).unwrap_or(ed.caret);
-            ed.caret_to_end = false;
-            ed.request_focus = true;
-            ed.sync_caret = true;
-            return;
+fn toggle_point_keys(app: &SheetApp, ed: &mut crate::editor::EditState) {
+    if !ed.is_formula() {
+        return;
+    }
+    ed.point_keys = !ed.point_keys;
+    ed.enter_mode = false;
+    if !ed.point_keys {
+        ed.point = None;
+        ed.point_cell = None;
+        ed.point_anchor = None;
+        return;
+    }
+    if ed.can_point() {
+        return;
+    }
+    let caret = ed.byte_caret();
+    if let Some((start, end, range, sheet, _)) = ed.references().into_iter().find(|(start, end, ..)| *start <= caret && caret <= *end) {
+        ed.point = Some((start, end));
+        ed.caret = ed.text[..end].chars().count();
+        ed.anchor = ed.caret;
+        ed.sync_caret = true;
+        if let Some(doc) = app.session.active() {
+            let index = sheet.as_deref().map_or(Some(ed.sheet), |name| doc.wb.sheet_index(name));
+            if index == Some(doc.wb.active_sheet()) {
+                ed.point_cell = Some(range.end);
+                ed.point_anchor = index.map(|i| (i, range.start));
+            }
         }
+    }
+}
+
+fn cycle_anchor(ed: &mut crate::editor::EditState) {
+    let caret = ed.byte_caret();
+    if let Some((start, end, ..)) = ed.references().into_iter().find(|(start, end, ..)| *start <= caret && caret <= *end) {
+        let cycled = crate::dialogs::cycle_anchors(&ed.text[start..end]);
+        ed.text.replace_range(start..end, &cycled);
+        let end_after = start + cycled.len();
+        if ed.point == Some((start, end)) {
+            ed.point = Some((start, end_after));
+        }
+        ed.caret = ed.text[..end_after].chars().count();
+        ed.anchor = ed.caret;
+        ed.caret_to_end = false;
+        ed.request_focus = true;
+        ed.sync_caret = true;
     }
 }
 

@@ -54,6 +54,12 @@ pub(super) fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Respo
     if app.text_box_editor.is_some() || app.grid.hf_edit.is_some() {
         return;
     }
+    if app.editor.is_some() && (resp.secondary_clicked() || resp.drag_started_by(egui::PointerButton::Secondary)) {
+        return;
+    }
+    if app.editor.is_some() && app.message.is_some() {
+        return;
+    }
     let ctx = ui.ctx().clone();
     // Enter/Space synthesize egui clicks; only real pointer clicks use sheet coordinates.
     let primary_clicked = resp.clicked_by(egui::PointerButton::Primary);
@@ -113,6 +119,15 @@ pub(super) fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Respo
         freeze_columns: freeze_cols,
         freeze_rows,
     };
+    let primary_drag = resp.drag_started_by(egui::PointerButton::Primary);
+    if (primary_clicked || primary_drag)
+        && app.dialog.is_none()
+        && app.editor.as_ref().is_some_and(|ed| ed.can_point())
+        && handle_reference_press(app, &input, primary_drag)
+    {
+        ctx.request_repaint();
+        return;
+    }
     if handle_draw_tool(app, &input) {
         return;
     }
@@ -140,7 +155,6 @@ pub(super) fn interact(app: &mut SheetApp, ui: &mut egui::Ui, resp: &egui::Respo
     }
     // Objects (charts, pictures, shapes, slicers) take clicks first. Only the primary button moves
     // them: a right-click that wobbles into a drag still opens the object's menu (#2067).
-    let primary_drag = resp.drag_started_by(egui::PointerButton::Primary);
     if primary_drag || primary_clicked {
         // A drag is recognised only after the pointer has moved, so grab the object where the press began.
         let at = if primary_drag { pointer.press_origin().map(|p| geo.mirror_pos(p)).or(pos) } else { pos };
@@ -348,7 +362,7 @@ fn handle_header_autofit(app: &mut SheetApp, input: &InteractionInput<'_>) -> bo
 }
 
 fn handle_column_header_press(app: &mut SheetApp, input: &InteractionInput<'_>, p: Pos2) {
-    let (geo, sh, wb, sel) = (input.geo, input.sheet, input.workbook, &input.selection);
+    let (geo, sh, sel) = (input.geo, input.sheet, &input.selection);
     let mods = input.selection_modifiers;
     let resp = input.response;
     let in_col_header = input.in_column_header;
@@ -362,10 +376,6 @@ fn handle_column_header_press(app: &mut SheetApp, input: &InteractionInput<'_>, 
         // A Table heading's filter button, while the header names stand in for the letters.
         if let Some(h) = table_headings(geo, sh, sel.active).into_iter().find(|h| h.col == c && h.button.is_some_and(|b| b.contains(p))) {
             app.grid.filter_menu = Some((c, h.header_row, geo.mirror_pos(p)));
-            return;
-        }
-        if point_header(app, wb, sh, RangeRef::cols(c, c), mods.shift, mods.command) {
-            point_header_first_move(app, input);
             return;
         }
         // An armed Format Painter paints the columns dragged over instead of moving them.
@@ -388,7 +398,7 @@ fn handle_column_header_press(app: &mut SheetApp, input: &InteractionInput<'_>, 
 }
 
 fn handle_row_header_press(app: &mut SheetApp, input: &InteractionInput<'_>, p: Pos2) {
-    let (geo, sh, wb, sel) = (input.geo, input.sheet, input.workbook, &input.selection);
+    let (geo, sh, sel) = (input.geo, input.sheet, &input.selection);
     let mods = input.selection_modifiers;
     let in_row_header = input.in_row_header;
     if in_row_header {
@@ -398,10 +408,6 @@ fn handle_row_header_press(app: &mut SheetApp, input: &InteractionInput<'_>, p: 
             return;
         }
         let r = geo.row_at(sh, p.y);
-        if point_header(app, wb, sh, RangeRef::rows(r, r), mods.shift, mods.command) {
-            point_header_first_move(app, input);
-            return;
-        }
         let range = if mods.shift { RangeRef::rows(sel.anchor.row.min(r), sel.anchor.row.max(r)) } else { RangeRef::rows(r, r) };
         app.grid.header_drag_base = add_mode_base(app);
         note_selecting_press(app);
@@ -481,40 +487,7 @@ fn handle_press(app: &mut SheetApp, input: &InteractionInput<'_>) {
         if resp.drag_started()
             && let Some(p) = pos
         {
-            select_to_pointer(app, geo, sh, wb, p);
-        }
-        return;
-    }
-    // Point mode while editing a formula: clicking inserts a reference.
-    if let Some(ed) = app.editor.as_mut()
-        && ed.can_point()
-    {
-        let anchor = if mods.shift && ed.point_at_caret() {
-            ed.point_anchor.filter(|(sheet, _)| *sheet == wb.active_sheet()).map(|(_, cell)| cell).unwrap_or(c)
-        } else {
-            c
-        };
-        let range = RangeRef::new(anchor, c);
-        let text = if range.is_single() { c.a1() } else { range.a1() };
-        let sheet_name = (ed.sheet != wb.active_sheet()).then(|| sh.name.clone());
-        let r = match sheet_name {
-            Some(n) => format!("{}!{text}", gridcraft_engine::formula::quote_sheet(&n)),
-            None => text,
-        };
-        if mods.command && !mods.shift {
-            ed.append_ref(&r);
-        } else {
-            ed.insert_ref(&r);
-        }
-        ed.request_focus = true;
-        ed.point_cell = Some(c);
-        ed.point_anchor = Some((wb.active_sheet(), anchor));
-        app.grid.drag = Drag::Select;
-        app.grid.drag_select = true;
-        if resp.drag_started()
-            && let Some(p) = pos
-        {
-            select_to_pointer(app, geo, sh, wb, p);
+            select_to_pointer(app, geo, sh, p);
         }
         return;
     }
@@ -593,7 +566,7 @@ fn handle_press(app: &mut SheetApp, input: &InteractionInput<'_>) {
         && let Some(p) = pos
     {
         // The first recognised drag already includes movement away from the press.
-        select_to_pointer(app, geo, sh, wb, p);
+        select_to_pointer(app, geo, sh, p);
     }
 }
 
@@ -746,8 +719,13 @@ fn handle_dragging(app: &mut SheetApp, input: &InteractionInput<'_>) {
         );
         match app.grid.drag.clone() {
             Drag::Select => {
-                select_to_pointer(app, geo, sh, wb, p);
+                select_to_pointer(app, geo, sh, p);
                 scroll_by(app, auto);
+            }
+            Drag::PointCells => {
+                point_cells_to(app, geo, sh, wb, p);
+                scroll_by(app, auto);
+                input.context.request_repaint();
             }
             Drag::Rows(anchor) => {
                 let r = geo.row_at(sh, p.y);
@@ -828,9 +806,17 @@ fn handle_release(app: &mut SheetApp, input: &InteractionInput<'_>) {
                 if resp.drag_stopped()
                     && let Some(p) = pos
                 {
-                    select_to_pointer(app, geo, sh, wb, p);
+                    select_to_pointer(app, geo, sh, p);
                 }
                 format_painter_apply(app);
+            }
+            Drag::PointCells => {
+                if resp.drag_stopped()
+                    && let Some(p) = pos
+                {
+                    point_cells_to(app, geo, sh, wb, p);
+                    ctx.request_repaint();
+                }
             }
             // Whole rows or columns clicked or dragged over by their headers.
             Drag::Rows(_) | Drag::Cols(_) => format_painter_apply(app),
@@ -937,6 +923,60 @@ fn format_painter_apply(app: &mut SheetApp) {
     }
 }
 
+/// Route formula picking before filters, objects and the ordinary selection can take the click.
+fn handle_reference_press(app: &mut SheetApp, input: &InteractionInput<'_>, drag: bool) -> bool {
+    let (geo, sh, wb, mods) = (input.geo, input.sheet, input.workbook, input.modifiers);
+    let pointer = if drag { input.press_origin.map(|p| geo.mirror_pos(p)).or(input.position) } else { input.position };
+    let Some(p) = pointer else { return false };
+    let whole = if p.x >= geo.cells.left() && p.x < geo.cells.right() && p.y >= geo.head_top() && p.y < geo.cells.top() {
+        let col = geo.col_at(sh, p.x);
+        Some(RangeRef::cols(col, col))
+    } else if p.y >= geo.cells.top() && p.y < geo.cells.bottom() && p.x >= geo.head_left() && p.x < geo.cells.left() {
+        let row = geo.row_at(sh, p.y);
+        Some(RangeRef::rows(row, row))
+    } else {
+        None
+    };
+    if let Some(range) = whole {
+        if !point_header(app, wb, sh, range, mods.shift, mods.command && !mods.shift) {
+            return false;
+        }
+        if drag {
+            point_header_first_move(app, input);
+        } else {
+            app.grid.drag = Drag::None;
+        }
+        app.grid.drag_select = false;
+        return true;
+    }
+    if !geo.in_cells(p) {
+        return false;
+    }
+    let cell = geo.cell_at(sh, p);
+    let cell = sh.merge_at(cell).map_or(cell, |r| r.start);
+    let Some(ed) = app.editor.as_mut() else { return false };
+    let sheet = wb.active_sheet();
+    let anchor =
+        if mods.shift && ed.point_at_caret() { ed.point_anchor.filter(|(index, _)| *index == sheet).map_or(cell, |(_, start)| start) } else { cell };
+    let reference = pointed_reference(ed, wb, sh, RangeRef::new(anchor, cell));
+    if mods.command && !mods.shift {
+        ed.append_ref(&reference);
+    } else {
+        ed.insert_ref(&reference);
+    }
+    ed.request_focus = true;
+    ed.point_cell = Some(cell);
+    ed.point_anchor = Some((sheet, anchor));
+    app.grid.drag_select = false;
+    app.grid.drag = if drag { Drag::PointCells } else { Drag::None };
+    if drag {
+        if let Some(p) = input.position {
+            point_cells_to(app, geo, sh, wb, p);
+        }
+    }
+    true
+}
+
 /// Point mode on a header: inserts a whole-row or whole-column reference instead of selecting,
 /// and dragging on from there extends it.
 fn point_header(app: &mut SheetApp, wb: &Workbook, sh: &Sheet, range: RangeRef, extend: bool, add: bool) -> bool {
@@ -946,7 +986,7 @@ fn point_header(app: &mut SheetApp, wb: &Workbook, sh: &Sheet, range: RangeRef, 
     let pressed = range;
     let range = if extend {
         ed.point
-            .and_then(|point| crate::editor::formula_refs(&ed.text).into_iter().find(|(start, end, ..)| (*start, *end) == point))
+            .and_then(|point| ed.references().into_iter().find(|(start, end, ..)| (*start, *end) == point))
             .and_then(|(_, _, previous, previous_sheet, _)| {
                 let previous_sheet = previous_sheet.as_deref().map(|name| wb.sheet_index(name)).unwrap_or(Some(edit_sheet));
                 if previous_sheet != Some(active_sheet) {
@@ -964,7 +1004,7 @@ fn point_header(app: &mut SheetApp, wb: &Workbook, sh: &Sheet, range: RangeRef, 
     } else {
         range
     };
-    let reference = header_reference(ed, wb, sh, range);
+    let reference = pointed_reference(ed, wb, sh, range);
     if add {
         ed.append_ref(&reference);
     } else {
@@ -982,7 +1022,7 @@ fn point_header(app: &mut SheetApp, wb: &Workbook, sh: &Sheet, range: RangeRef, 
     true
 }
 
-fn header_reference(ed: &EditState, wb: &Workbook, sh: &Sheet, range: RangeRef) -> String {
+fn pointed_reference(ed: &EditState, wb: &Workbook, sh: &Sheet, range: RangeRef) -> String {
     let reference = range.a1();
     if ed.sheet != wb.active_sheet() { format!("{}!{reference}", gridcraft_engine::formula::quote_sheet(&sh.name)) } else { reference }
 }
@@ -1014,30 +1054,35 @@ fn point_header_to(app: &mut SheetApp, geo: &Geo, sh: &Sheet, wb: &Workbook, dra
         _ => return,
     };
     let Some(ed) = app.editor.as_mut().filter(|ed| ed.point_at_caret()) else { return };
-    let reference = header_reference(ed, wb, sh, range);
+    let reference = pointed_reference(ed, wb, sh, range);
     ed.insert_ref(&reference);
     ed.point_cell = Some(pointer);
     ed.point_anchor = Some((wb.active_sheet(), opposite));
 }
 
-fn select_to_pointer(app: &mut SheetApp, geo: &Geo, sh: &Sheet, wb: &Workbook, p: Pos2) {
-    let cell = CellRef::new(
+fn drag_cell(geo: &Geo, sh: &Sheet, p: Pos2) -> CellRef {
+    CellRef::new(
         geo.row_at(sh, p.y.clamp(geo.cells.top() + 1.0, geo.cells.bottom() - 1.0)),
         geo.col_at(sh, p.x.clamp(geo.cells.left() + 1.0, geo.cells.right() - 1.0)),
-    );
+    )
+}
+
+fn point_cells_to(app: &mut SheetApp, geo: &Geo, sh: &Sheet, wb: &Workbook, p: Pos2) {
+    let cell = drag_cell(geo, sh, p);
+    let cell = sh.merge_at(cell).map_or(cell, |r| r.start);
+    if let Some(ed) = app.editor.as_mut().filter(|ed| ed.point_at_caret() && ed.point_cell != Some(cell))
+        && let Some((_, start)) = ed.point_anchor.filter(|(sheet, _)| *sheet == wb.active_sheet())
+    {
+        let reference = pointed_reference(ed, wb, sh, RangeRef::new(start, cell));
+        ed.insert_ref(&reference);
+        ed.point_cell = Some(cell);
+    }
+}
+
+fn select_to_pointer(app: &mut SheetApp, geo: &Geo, sh: &Sheet, p: Pos2) {
+    let cell = drag_cell(geo, sh, p);
     if let Some(d) = app.dialog.as_mut().filter(|d| d.picks_references()) {
         d.pick_reference(cell, &sh.name, true);
-    } else if let Some(ed) = app.editor.as_mut()
-        && ed.point.is_some()
-    {
-        if let Some(start) = ed.point_anchor.filter(|(sheet, _)| *sheet == wb.active_sheet()).map(|(_, cell)| cell).or(ed.point_cell) {
-            let range = RangeRef::new(start, cell);
-            let text = if range.is_single() { range.start.a1() } else { range.a1() };
-            let text = if ed.sheet != wb.active_sheet() { format!("{}!{text}", gridcraft_engine::formula::quote_sheet(&sh.name)) } else { text };
-            ed.insert_ref(&text);
-            ed.point_cell = Some(cell);
-            ed.point_anchor = Some((wb.active_sheet(), start));
-        }
     } else if let Some(d) = app.session.active() {
         // Read the current anchor: starting a drag may have just replaced the selection.
         let anchor = d.selection.anchor;
@@ -1428,7 +1473,8 @@ pub fn follow_link(app: &mut SheetApp, target: &str) {
 pub fn point_move(app: &mut SheetApp, ed: &mut EditState, dr: i64, dc: i64, extend: bool, jump: bool) {
     let Some(d) = app.session.active() else { return };
     let Some(sheet) = d.wb.active() else { return };
-    let from = ed.point_cell.unwrap_or(ed.cell);
+    let origin = if ed.sheet == d.wb.active_sheet() { ed.cell } else { d.selection.active };
+    let from = ed.point_cell.unwrap_or(origin);
     let to = if jump { gridcraft_engine::selection::jump(sheet, from, dr.signum(), dc.signum()) } else { from.offset_clamped(dr, dc) };
     let anchor = if extend {
         // The anchor is the corner opposite the moving end: the written range is normalized, so
